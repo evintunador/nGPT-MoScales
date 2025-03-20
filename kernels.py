@@ -12,10 +12,30 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 @torch.compile
 def cosine_norm_naive(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Places vectors onto the unit-hypersphere"""
-    # calculate the magnitude of the vectors
-    norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
-    # divide by the magnitude to place on the unit hypersphere
-    return x / norm
+    with torch.no_grad():
+        # calculate the magnitude of the vectors
+        norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
+        # divide by the magnitude to place on the unit hypersphere
+        return x / norm
+
+@torch.compile
+def cosine_norm_backward_naive(x: torch.Tensor, grad_output: torch.Tensor, dim: int = -1) -> torch.Tensor:
+    """Computes the gradient for cosine normalization.
+    
+    The gradient is: grad_input = (grad_output - y * sum(y * grad_output)) / norm
+    where y is the normalized output.
+    """
+    with torch.no_grad():
+        norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
+        y = x / norm
+        
+        # Compute sum(y * grad_output) along specified dimension
+        grad_dot_y = torch.sum(y * grad_output, dim=dim, keepdim=True)
+        
+        # Compute the gradient
+        grad_input = (grad_output - y * grad_dot_y) / norm
+        
+        return grad_input
 
 
 @triton.jit
@@ -40,13 +60,64 @@ def cos_norm_fwd(
 
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
+@triton.jit
+def cos_norm_fwd(
+    x_ptr, dLdx, y, dLdy,
+    stride_M, stride_N,
+    N,
+    BLOCK_SIZE: tl.constexpr
+):
+    pass
+
+
 # used to derive our block size
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
 sram_per_sm = properties["max_shared_mem"]
 
-#@torch.compile(fullgraph=True) # <- gives error for some reason
-#@triton_op("mylib::cos_norm", mutates_args={})
-def cosine_norm_triton(x: torch.Tensor, inplace: bool = False) -> torch.Tensor:
+class _cosine_norm_triton(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x):
+        # we know this function will only be used on dim=-1 in nGPT
+        M, N = x.reshape(-1, x.shape[-1]).shape
+
+        # this kernel is designed for normalizing vectors that fit in SRAM
+        max_entries = sram_per_sm // x.element_size()
+        block_size = triton.next_power_of_2(N)
+        assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
+        # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
+
+        # pre-allocate output
+        y = torch.empty_like(x)
+
+        # each row gets it own PID
+        cos_norm_fwd[(M,)](x, y, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
+
+        ctx.save_for_backward(x)
+        ctx.M, ctx.N, ctx.block_size = M, N, ctx.block_size
+        return y
+
+    @staticmethod
+    def backward(ctx, dLdy):
+        x, = ctx.saved_tensors
+        M, N, block_size = ctx.M, ctx.N, ctx.block_size
+
+        # pre-allocate gradient
+        dLdx = torch.empty_like(x)
+"""
+        cos_norm_bwd[(M,)](
+            x, dLdx, y, dLdy,
+            x.stride(-2), x.stride(-1),
+            N,
+            BLOCK_SIZE=block_size
+        )"""
+
+        return dLdx
+
+cosine_norm_triton = _cosine_norm_triton.apply
+
+
+def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
+    """In-place version of cosine_norm_triton forward pass following PyTorch naming convention"""
     # we know this function will only be used on dim=-1 in nGPT
     M, N = x.reshape(-1, x.shape[-1]).shape
 
@@ -56,35 +127,24 @@ def cosine_norm_triton(x: torch.Tensor, inplace: bool = False) -> torch.Tensor:
     assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
     # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
-    # pre-allocate output or use input tensor for in-place operation
-    y = x if inplace else torch.empty_like(x)
-
     # each row gets it own PID
-    cos_norm_fwd[(M,)](
-        x, y,
-        x.stride(-2), x.stride(-1),
-        N,
-        BLOCK_SIZE=block_size
-    )
+    cos_norm_fwd[(M,)](x, x, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
 
-    return y
+    return x
 
-def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
-    """In-place version of cosine_norm_triton following PyTorch naming convention"""
-    return cosine_norm_triton(x, inplace=True)
 
 def test_cos_norm(M, N, dtype, device=DEVICE):
     # create data
     x = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
-    x_clone = x.clone()  # for in-place testing
-
-    # run each
-    y_torch = torch.nn.functional.normalize(x, p=2, dim=1)
-    y_naive = cosine_norm_naive(x)
-    y_triton = cosine_norm_triton(x)
+    x_torch = x.clone().detach().requires_grad_(True)
+    x_naive = x.clone().detach().requires_grad_(True)
+    x_inplace = x.clone().detach().requires_grad_(False)
     
-    # test in-place version
-    y_triton_inplace = cosine_norm_triton_(x_clone)
+    # run each
+    y_torch = torch.nn.functional.normalize(x_torch, p=2, dim=1)
+    y_naive = cosine_norm_naive(x_naive)
+    y_triton = cosine_norm_triton(x)
+    y_triton_inplace = cosine_norm_triton_(x_inplace)
 
     # test out-of-place results
     torch.testing.assert_close(y_torch, y_naive, atol=1e-3, rtol=1e-3)
@@ -98,8 +158,23 @@ def test_cos_norm(M, N, dtype, device=DEVICE):
     print(f"✓ Triton in-place implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
     
     # verify in-place operation actually modified the input
-    assert x_clone is y_triton_inplace, "In-place operation failed to modify input tensor"
+    assert x_inplace is y_triton_inplace, "In-place operation failed to modify input tensor"
     print(f"✓ Verified in-place operation modified input tensor")
+    
+    # Test backward pass
+    # Create a gradient tensor
+    grad_output = torch.randn_like(x)
+    
+    # Compute backward pass with PyTorch's autograd
+    y_torch.backward(grad_output, retain_graph=True)
+    torch_grad = x_torch.grad.clone()
+    
+    # Compute backward pass with our naive implementation
+    naive_grad = cosine_norm_backward_naive(x_naive.detach(), grad_output, dim=1)
+    
+    # Compare gradients
+    torch.testing.assert_close(torch_grad, naive_grad, atol=1e-3, rtol=1e-3)
+    print(f"✓ Naive backward implementation passed gradient test (M={M}, N={N}, dtype={dtype})")
 
 
 def previous_power_two(n):
