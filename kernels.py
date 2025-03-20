@@ -18,16 +18,6 @@ def cosine_norm_naive(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     return x / norm
 
 
-@triton.autotune( # decorator figures out what meta-parameters will be most efficient
-    [
-        triton.Config(
-            num_stages=num_stages, num_warps=num_warps,
-        )
-        for num_stages in [3, 5, 7]
-        for num_warps in [4, 8, 16, 32]
-    ],
-    key=["N"],
-)
 @triton.jit
 def cos_norm_fwd(
     x_ptr,
@@ -43,19 +33,19 @@ def cos_norm_fwd(
     # compute L_2 norm
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
-    x = tl.load(x_ptr + cols, mask=mask, other=0.)
+    x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     eps: tl.constexpr = 1e-12
-    y = x / (norm + eps) # TODO does this need to be tl.full()?
+    y = x / (norm + eps)
 
-    tl.store(y_ptr + cols, y, mask=mask)
+    tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
 
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
 sram_per_sm = properties["max_shared_mem"]
 # should derive how big a hidden dimension we can do using this
 
-@torch.compile(full_graph=True)
+#@torch.compile(fullgraph=False) # <- gives error for some reason
 def cosine_norm_triton(x: torch.Tensor) -> torch.Tensor:
     # we know this function will only be used on dim=-1 in nGPT
     M, N = x.reshape(-1, x.shape[-1]).shape
@@ -96,8 +86,57 @@ def test_cos_norm(M, N, dtype, device=DEVICE):
     print("triton passed cos norm")
 
 
-test_cos_norm(2048, 768)
-test_cos_norm(2048, 8192)
+def power_two(n):
+    return int(math.log(n, 2))
+
+configs = []
+for dtype_bytes in [2, 4]:
+    configs.append(
+        triton.testing.Benchmark(
+            x_names=['N'],
+            x_vals=[2 ** i for i in range(1, power_two(sram_per_sm // dtype_bytes))], 
+            line_arg='provider',
+            line_vals=['triton', 'torch', 'naive'],
+            line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'],
+            styles=[('blue', '-'), ('green', '-'), ('red', '-')],
+            ylabel='GB/s',
+            plot_name=f'cos_norm_fwd_fp{8*dtype_bytes}',
+            args={"dtype_bytes": dtype_bytes}, 
+        ))
+@triton.testing.perf_report(configs)
+def benchmark(N, provider, dtype_bytes, device=DEVICE):
+    # create data
+    assert dtype_bytes in [2, 4]
+    dtype = torch.float16 if dtype_bytes == 2 else torch.float32
+    x = torch.randn((32*1024, N), dtype=dtype, device=device, requires_grad=False)
+
+    # confidence itnerval for testing
+    quantiles = [0.5, 0.001, 0.999]
+
+    def y_fwd():
+        if provider == "triton":
+            return cosine_norm_triton(x)
+        if provider == "torch":
+            return torch.nn.functional.normalize(x, p=2, dim=1)
+        if provider == "naive":
+            return cosine_norm_naive(x)
+
+    # benchmark
+    ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
+    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    return gbps(ms), gbps(max_ms), gbps(min_ms)
+
+
+if __name__ == "__main__":
+    # always run unit-tests
+    test_cos_norm(2048, 768, torch.float32)
+    test_cos_norm(2048, 8192, torch.float32)
+
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        benchmark.run(save_path='./benchmarks/', print_data=False)
+
 
 
 
