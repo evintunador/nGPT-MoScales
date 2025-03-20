@@ -29,10 +29,10 @@ def cos_norm_fwd(
     row = tl.program_id(0)
     x_ptr += row * stride_M
     y_ptr += row * stride_M
-
-    # compute L_2 norm
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
+
+    # compute L_2 norm
     x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     eps: tl.constexpr = 1e-12
@@ -40,13 +40,13 @@ def cos_norm_fwd(
 
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
-
+# used to derive our block size
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
 sram_per_sm = properties["max_shared_mem"]
-# should derive how big a hidden dimension we can do using this
 
-#@torch.compile(fullgraph=False) # <- gives error for some reason
-def cosine_norm_triton(x: torch.Tensor) -> torch.Tensor:
+#@torch.compile(fullgraph=True) # <- gives error for some reason
+#@triton_op("mylib::cos_norm", mutates_args={})
+def cosine_norm_triton(x: torch.Tensor, inplace: bool = False) -> torch.Tensor:
     # we know this function will only be used on dim=-1 in nGPT
     M, N = x.reshape(-1, x.shape[-1]).shape
 
@@ -56,8 +56,8 @@ def cosine_norm_triton(x: torch.Tensor) -> torch.Tensor:
     assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
     # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
-    # pre-allocate output
-    y = torch.empty_like(x)
+    # pre-allocate output or use input tensor for in-place operation
+    y = x if inplace else torch.empty_like(x)
 
     # each row gets it own PID
     cos_norm_fwd[(M,)](
@@ -69,24 +69,40 @@ def cosine_norm_triton(x: torch.Tensor) -> torch.Tensor:
 
     return y
 
+def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
+    """In-place version of cosine_norm_triton following PyTorch naming convention"""
+    return cosine_norm_triton(x, inplace=True)
 
 def test_cos_norm(M, N, dtype, device=DEVICE):
     # create data
     x = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
+    x_clone = x.clone()  # for in-place testing
 
     # run each
     y_torch = torch.nn.functional.normalize(x, p=2, dim=1)
     y_naive = cosine_norm_naive(x)
     y_triton = cosine_norm_triton(x)
+    
+    # test in-place version
+    y_triton_inplace = cosine_norm_triton_(x_clone)
 
-    # test
+    # test out-of-place results
     torch.testing.assert_close(y_torch, y_naive, atol=1e-3, rtol=1e-3)
-    print("naive passed cos norm")
+    print(f"✓ Naive implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
+    
     torch.testing.assert_close(y_torch, y_triton, atol=1e-3, rtol=1e-3)
-    print("triton passed cos norm")
+    print(f"✓ Triton implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
+    
+    # test in-place results
+    torch.testing.assert_close(y_torch, y_triton_inplace, atol=1e-3, rtol=1e-3)
+    print(f"✓ Triton in-place implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
+    
+    # verify in-place operation actually modified the input
+    assert x_clone is y_triton_inplace, "In-place operation failed to modify input tensor"
+    print(f"✓ Verified in-place operation modified input tensor")
 
 
-def power_two(n):
+def previous_power_two(n):
     return int(math.log(n, 2))
 
 configs = []
@@ -94,7 +110,7 @@ for dtype_bytes in [2, 4]:
     configs.append(
         triton.testing.Benchmark(
             x_names=['N'],
-            x_vals=[2 ** i for i in range(1, power_two(sram_per_sm // dtype_bytes))], 
+            x_vals=[2 ** i for i in range(1, previous_power_two(sram_per_sm // dtype_bytes))], 
             line_arg='provider',
             line_vals=['triton', 'torch', 'naive'],
             line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'],
@@ -116,6 +132,7 @@ def benchmark(N, provider, dtype_bytes, device=DEVICE):
     def y_fwd():
         if provider == "triton":
             return cosine_norm_triton(x)
+            #return torch.ops.mylib.cos_norm.default(x)
         if provider == "torch":
             return torch.nn.functional.normalize(x, p=2, dim=1)
         if provider == "naive":
@@ -129,6 +146,8 @@ def benchmark(N, provider, dtype_bytes, device=DEVICE):
 
 if __name__ == "__main__":
     # always run unit-tests
+    test_cos_norm(2048, 768, torch.float16)
+    test_cos_norm(2048, 8192, torch.float16)
     test_cos_norm(2048, 768, torch.float32)
     test_cos_norm(2048, 8192, torch.float32)
 
