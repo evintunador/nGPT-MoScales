@@ -1,0 +1,2 @@
+# about
+in this repo i'll be taking my original [nGPT]() replication and speeding it up with some custom Triton kernels. I'm doing so because a potential employer found me through the nGPT replication and we decided to do a lil project in lieu of a regular coding interview
