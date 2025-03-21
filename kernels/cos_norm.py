@@ -58,9 +58,10 @@ def cos_norm_fwd(
     x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
 
     # compute L_2 norm & normalize
-    norm = tl.sqrt(tl.sum(x * x, axis=0))
     eps: tl.constexpr = 1e-12
-    y = x / (norm + eps)
+    inf: tl.constexpr = 1e12
+    norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
+    y = x / norm
 
     tl.store(norm_ptr, norm)
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
