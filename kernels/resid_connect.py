@@ -14,17 +14,55 @@ import triton.language as tl
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-from cos_norm import cosine_norm_forward_naive
+from cos_norm import cosine_norm_forward_naive, cosine_norm_backward_naive
 
 @torch.compile
 def resid_connect_fwd_naive(h, h_eigen, alpha):
     """
-    h & h_eigen: shape (B, N, D) assuming transformer
-    alpha: shape (D)
+    h & h_eigen: shape (M, N) 
+    alpha: shape (N)
     """
-    h_eigen = cosine_norm_forward_naive(h_eigen)
-    h = cosine_norm_forward_naive(h + alpha * (h_eigen - h))
+    with torch.no_grad():
+        h_eigen = cosine_norm_forward_naive(h_eigen)
+        h = cosine_norm_forward_naive(h + alpha * (h_eigen - h))
     return h
+
+
+@torch.compile
+def resid_connect_bwd_naive(h, h_eigen, alpha, grad_output):
+    """
+    Computes gradients for residual connection with cosine normalization
+    
+    Args:
+        h: original input, shape (M, N)
+        h_eigen: eigenspace input, shape (M, N)
+        alpha: scaling factor, shape (N)
+        grad_output: gradient from upstream, shape (M, N)
+    
+    Returns:
+        grad_h: gradient for h
+        grad_h_eigen: gradient for h_eigen
+        grad_alpha: gradient for alpha
+    """
+    with torch.no_grad():
+        # Forward pass computations we need
+        h_eigen_normed = cosine_norm_forward_naive(h_eigen)
+        residual = h + alpha * (h_eigen_normed - h)
+        
+        # Backward pass through the final normalization
+        grad_residual = cosine_norm_backward_naive(residual, grad_output)
+        
+        # Gradients for the residual connection components
+        grad_h = grad_residual * (1 - alpha)
+        grad_h_eigen_normed = grad_residual * alpha
+        
+        # Backward pass through the first normalization (h_eigen)
+        grad_h_eigen = cosine_norm_backward_naive(h_eigen, grad_h_eigen_normed)
+        
+        # Compute gradient for alpha
+        grad_alpha = torch.sum(grad_residual * (h_eigen_normed - h), dim=(0, 1))
+    
+    return grad_h, grad_h_eigen, grad_alpha
 
 
 @triton.jit
@@ -188,6 +226,7 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
     gbps = lambda ms: (4 if mode == "fwd" else 3) * h.numel() * h.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
+
 
 
 if __name__ == "__main__":
