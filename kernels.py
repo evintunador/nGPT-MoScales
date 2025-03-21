@@ -1,6 +1,7 @@
 import math
 
 import torch
+#print(torch.__version__)
 import torch.nn as nn
 import torch.nn.functional as F
 
@@ -10,7 +11,7 @@ import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 @torch.compile
-def cosine_norm_naive(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
+def cosine_norm_forward_naive(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Places vectors onto the unit-hypersphere"""
     with torch.no_grad():
         # calculate the magnitude of the vectors
@@ -42,6 +43,7 @@ def cosine_norm_backward_naive(x: torch.Tensor, grad_output: torch.Tensor, dim: 
 def cos_norm_fwd(
     x_ptr,
     y_ptr,
+    norm_ptr,
     stride_M, stride_N,
     N,
     BLOCK_SIZE: tl.constexpr
@@ -49,25 +51,47 @@ def cos_norm_fwd(
     row = tl.program_id(0)
     x_ptr += row * stride_M
     y_ptr += row * stride_M
+    norm_ptr += row
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
 
-    # compute L_2 norm
     x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
+
+    # compute L_2 norm & normalize
     norm = tl.sqrt(tl.sum(x * x, axis=0))
     eps: tl.constexpr = 1e-12
     y = x / (norm + eps)
 
+    tl.store(norm_ptr, norm)
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
 @triton.jit
-def cos_norm_fwd(
-    x_ptr, dLdx, y, dLdy,
+def cos_norm_bwd(
+    x_ptr, dLdx_ptr, y_ptr, dLdy_ptr, norm_ptr,
     stride_M, stride_N,
     N,
     BLOCK_SIZE: tl.constexpr
 ):
-    pass
+    row = tl.program_id(0)
+    x_ptr += row * stride_M
+    dLdx_ptr += row * stride_M
+    y_ptr += row * stride_M
+    dLdy_ptr += row * stride_M
+    norm_ptr += row
+    cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
+    mask = cols < N
+
+    x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    dLdy = tl.load(dLdy_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    norm = tl.load(norm_ptr) # fp32
+
+    # compute grad
+    y = x / norm
+    dLdy_dot_y = tl.sum(y * dLdy, axis=0)
+    dLdx = (dLdy - y * dLdy_dot_y) / norm
+    
+    tl.store(dLdx_ptr + cols, dLdx.to(x_ptr.type.element_ty), mask=mask)
+
 
 
 # used to derive our block size
@@ -86,30 +110,31 @@ class _cosine_norm_triton(torch.autograd.Function):
         assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
         # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
-        # pre-allocate output
+        # pre-allocate output & norm storage for bwd pass
         y = torch.empty_like(x)
+        norm = torch.empty((M,), device=x.device, dtype=torch.float32, requires_grad=False)
 
         # each row gets it own PID
-        cos_norm_fwd[(M,)](x, y, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
+        cos_norm_fwd[(M,)](x, y, norm, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
 
-        ctx.save_for_backward(x)
-        ctx.M, ctx.N, ctx.block_size = M, N, ctx.block_size
+        ctx.save_for_backward(x, y, norm)
+        ctx.M, ctx.N, ctx.block_size = M, N, block_size
         return y
 
     @staticmethod
     def backward(ctx, dLdy):
-        x, = ctx.saved_tensors
+        x, y, norm = ctx.saved_tensors
         M, N, block_size = ctx.M, ctx.N, ctx.block_size
 
         # pre-allocate gradient
         dLdx = torch.empty_like(x)
-"""
+        
         cos_norm_bwd[(M,)](
-            x, dLdx, y, dLdy,
+            x, dLdx, y, dLdy, norm,
             x.stride(-2), x.stride(-1),
             N,
             BLOCK_SIZE=block_size
-        )"""
+        )
 
         return dLdx
 
@@ -127,95 +152,98 @@ def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
     assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
     # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
+    # kernel requires we pre-allocate tensor to store norms for backward pass # TODO make inplace separate kernel
+    _ = torch.empty((M,), dtype=torch.float32, device=x.device, requires_grad=False)
+
     # each row gets it own PID
-    cos_norm_fwd[(M,)](x, x, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
+    cos_norm_fwd[(M,)](x, x, _, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
 
     return x
 
 
 def test_cos_norm(M, N, dtype, device=DEVICE):
     # create data
-    x = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
-    x_torch = x.clone().detach().requires_grad_(True)
-    x_naive = x.clone().detach().requires_grad_(True)
-    x_inplace = x.clone().detach().requires_grad_(False)
+    x_triton = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
+    x_torch = x_triton.clone().detach().requires_grad_(True)
+    x_naive = x_triton.clone().detach().requires_grad_(True)
+    x_inplace = x_triton.clone().detach().requires_grad_(False)
     
     # run each
     y_torch = torch.nn.functional.normalize(x_torch, p=2, dim=1)
-    y_naive = cosine_norm_naive(x_naive)
-    y_triton = cosine_norm_triton(x)
+    y_naive = cosine_norm_forward_naive(x_naive)
+    y_triton = cosine_norm_triton(x_triton)
     y_triton_inplace = cosine_norm_triton_(x_inplace)
 
-    # test out-of-place results
+    # test each
     torch.testing.assert_close(y_torch, y_naive, atol=1e-3, rtol=1e-3)
     print(f"✓ Naive implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
-    
     torch.testing.assert_close(y_torch, y_triton, atol=1e-3, rtol=1e-3)
     print(f"✓ Triton implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
-    
-    # test in-place results
     torch.testing.assert_close(y_torch, y_triton_inplace, atol=1e-3, rtol=1e-3)
     print(f"✓ Triton in-place implementation passed cos norm test (M={M}, N={N}, dtype={dtype})")
-    
-    # verify in-place operation actually modified the input
     assert x_inplace is y_triton_inplace, "In-place operation failed to modify input tensor"
     print(f"✓ Verified in-place operation modified input tensor")
     
     # Test backward pass
-    # Create a gradient tensor
-    grad_output = torch.randn_like(x)
-    
-    # Compute backward pass with PyTorch's autograd
+    grad_output = torch.randn_like(x_triton)
     y_torch.backward(grad_output, retain_graph=True)
-    torch_grad = x_torch.grad.clone()
-    
-    # Compute backward pass with our naive implementation
+    torch_grad = x_torch.grad.clone().detach()
     naive_grad = cosine_norm_backward_naive(x_naive.detach(), grad_output, dim=1)
+    y_triton.backward(grad_output, retain_graph=True)
+    triton_grad = x_triton.grad.clone().detach()
     
     # Compare gradients
     torch.testing.assert_close(torch_grad, naive_grad, atol=1e-3, rtol=1e-3)
     print(f"✓ Naive backward implementation passed gradient test (M={M}, N={N}, dtype={dtype})")
+    torch.testing.assert_close(torch_grad, triton_grad, atol=1e-3, rtol=1e-3)
+    print(f"✓ Triton backward implementation passed gradient test (M={M}, N={N}, dtype={dtype})")
 
 
 def previous_power_two(n):
     return int(math.log(n, 2))
 
 configs = []
-for dtype_bytes in [2, 4]:
-    configs.append(
-        triton.testing.Benchmark(
-            x_names=['N'],
-            x_vals=[2 ** i for i in range(1, previous_power_two(sram_per_sm // dtype_bytes))], 
-            line_arg='provider',
-            line_vals=['triton', 'torch', 'naive'],
-            line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'],
-            styles=[('blue', '-'), ('green', '-'), ('red', '-')],
-            ylabel='GB/s',
-            plot_name=f'cos_norm_fwd_fp{8*dtype_bytes}',
-            args={"dtype_bytes": dtype_bytes}, 
-        ))
+for mode in ["fwd", "bwd"]:
+    for dtype_bytes in [2, 4]:
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=['N'],
+                x_vals=[2 ** i for i in range(8, previous_power_two(sram_per_sm // dtype_bytes))], 
+                line_arg='provider',
+                line_vals=['triton', 'torch', 'naive'],
+                line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'],
+                styles=[('blue', '-'), ('green', '-'), ('red', '-')],
+                ylabel='GB/s',
+                plot_name=f'cos_norm_{mode}_fp{8*dtype_bytes}',
+                args={"mode": mode, "dtype_bytes": dtype_bytes}, 
+            ))
 @triton.testing.perf_report(configs)
-def benchmark(N, provider, dtype_bytes, device=DEVICE):
+def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
     # create data
     assert dtype_bytes in [2, 4]
     dtype = torch.float16 if dtype_bytes == 2 else torch.float32
-    x = torch.randn((32*1024, N), dtype=dtype, device=device, requires_grad=False)
+    x = torch.randn((32*1024, N), dtype=dtype, device=device, requires_grad=True)
 
     # confidence itnerval for testing
     quantiles = [0.5, 0.001, 0.999]
 
-    def y_fwd():
-        if provider == "triton":
-            return cosine_norm_triton(x)
-            #return torch.ops.mylib.cos_norm.default(x)
-        if provider == "torch":
-            return torch.nn.functional.normalize(x, p=2, dim=1)
+    if provider == "torch":
+        fn = lambda: torch.nn.functional.normalize(x, p=2, dim=1)
+    if provider == "naive":
+        fn = lambda: cosine_norm_forward_naive(x)
+    if provider == "triton":
+        fn = lambda: cosine_norm_triton(x)
+    elif mode == "bwd":
+        y = fn()
+        dLdy = torch.randn_like(y)
         if provider == "naive":
-            return cosine_norm_naive(x)
-
+            fn = lambda: cosine_norm_backward_naive(x, dLdy)
+        else:
+            fn = lambda: y.backward(dLdy, retain_graph=True)
+    
     # benchmark
-    ms, min_ms, max_ms = triton.testing.do_bench(y_fwd, quantiles=quantiles, rep=500)
-    gbps = lambda ms: 2 * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    gbps = lambda ms: (2 if mode == "fwd" else 3) * x.numel() * x.element_size() * 1e-9 / (ms * 1e-3)
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
