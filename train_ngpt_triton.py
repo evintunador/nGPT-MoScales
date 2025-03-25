@@ -26,9 +26,7 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-def norm_(x: Tensor, dim: int = -1):
-    """in-place cosine normalization"""
-    x.div_(x.norm(p=2, dim=dim, keepdim=True))
+from kernels.cos_norm import cosine_norm_triton, cosine_norm_triton_
 
 class Scale(nn.Module):
     """
@@ -104,8 +102,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, self.head_dim)
         # normalizing & scaling our queries  & keys (see page 4)
         s_qk = self.s_qk() # (num_heads, head_dim)
-        q = torch.nn.functional.normalize(q, p=2, dim=-1) * s_qk # then scale each head
-        k = torch.nn.functional.normalize(k, p=2, dim=-1) * s_qk # no shape change
+        q = cosine_norm_triton(q, dim=-1) * s_qk # then scale each head
+        k = cosine_norm_triton(k, dim=-1) * s_qk # no shape change
         # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
         # the meat of the attention calculation
@@ -155,10 +153,10 @@ class Block(nn.Module):
         self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x_A = torch.nn.functional.normalize(self.attn(x, block_mask), p=2, dim=-1)
-        x = torch.nn.functional.normalize(x + self.alpha_A() * (x_A - x), p=2, dim=-1)
-        x_M = torch.nn.functional.normalize(self.mlp(x), p=2, dim=-1)
-        x = torch.nn.functional.normalize(x + self.alpha_M() * (x_M - x), p=2, dim=-1)
+        x_A = cosine_norm_triton(self.attn(x, block_mask), dim=-1)
+        x = cosine_norm_triton(x + self.alpha_A() * (x_A - x), dim=-1)
+        x_M = cosine_norm_triton(self.mlp(x), dim=-1)
+        x = cosine_norm_triton(x + self.alpha_M() * (x_M - x), dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
@@ -252,8 +250,7 @@ class GPT(nn.Module):
         
         if dim_to_normalize is not None:
             # Normalize the weights in-place
-            norm_(module.weight.data, dim=dim_to_normalize)
-            #weight.div_(weight.norm(p=2, dim=dim_to_normalize, keepdim=True))
+            cosine_norm_triton__(module.weight.data, dim=dim_to_normalize)
 
     def enforce_constraints(self):
         """
@@ -384,7 +381,7 @@ class Hyperparameters:
     train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
     val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 10000 # number of iterations to run
+    num_iterations = 10 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture
