@@ -4,3 +4,7 @@ in this repo i'll be taking my original [nGPT](https://github.com/evintunador/nG
 ```
 torchrun --nproc_per_node=2 train_ngpt.py
 ```
+
+```
+torchrun --nproc_per_node=2 train_ngpt_triton.py
+```
