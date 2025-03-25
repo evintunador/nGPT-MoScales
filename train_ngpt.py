@@ -21,25 +21,14 @@ torch.set_float32_matmul_precision('high')
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
-# use of FlexAttention contributed by @KoszarskyB
 from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_block_mask
-#torch._inductor.config.coordinate_descent_tuning = True # we have banned this flag for new records because it causes compilation to take 30min
 
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-from kernels.cos_norm import cosine_norm_triton, cosine_norm_triton_
-norm = cosine_norm_triton
-norm_ = cosine_norm_triton_
-"""
-def norm(x: Tensor):
-    return F.rms_norm(x, (x.size(-1),))
-def cosine_norm(x: torch.Tensor, dim=-1) -> torch.Tensor:
-    # calculate the magnitude of the vectors
-    norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-6)
-    # divide by the magnitude to place on the unit hypersphere
-    return x / norm
-"""
+def norm_(x: Tensor, dim: int = -1):
+    """in-place cosine normalization"""
+    x.div_(x.norm(p=2, dim=dim, keepdim=True))
 
 class Scale(nn.Module):
     """
@@ -67,7 +56,6 @@ class Scale(nn.Module):
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
-        # half-truncate RoPE by @YouJiacheng (w/ base freq tuning)
         # Ensure we don't exceed the dimension size
         dim_quarter = max(1, dim // 4)
         angular_freq = (1 / 1024) ** torch.linspace(0, 1, steps=dim_quarter, dtype=torch.float32)
@@ -116,8 +104,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, self.head_dim)
         # normalizing & scaling our queries  & keys (see page 4)
         s_qk = self.s_qk() # (num_heads, head_dim)
-        q = norm(q) * s_qk # then scale each head
-        k = norm(k) * s_qk # no shape change
+        q = torch.nn.functional.normalize(q, p=2, dim=-1) * s_qk # then scale each head
+        k = torch.nn.functional.normalize(k, p=2, dim=-1) * s_qk # no shape change
         # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
         # the meat of the attention calculation
@@ -167,10 +155,10 @@ class Block(nn.Module):
         self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x_A = self.attn(x, block_mask)
-        x = norm(x + self.alpha_A() * (x_A - x))
-        x_M = self.mlp(x)
-        x = norm(x + self.alpha_M() * (x_M - x))
+        x_A = torch.nn.functional.normalize(self.attn(x, block_mask), p=2, dim=-1)
+        x = torch.nn.functional.normalize(x + self.alpha_A() * (x_A - x), p=2, dim=-1)
+        x_M = torch.nn.functional.normalize(self.mlp(x), p=2, dim=-1)
+        x = torch.nn.functional.normalize(x + self.alpha_M() * (x_M - x), p=2, dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
@@ -184,11 +172,13 @@ class GPT(nn.Module):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
+        self.vocab_size = vocab_size
         self.embed = nn.Embedding(vocab_size, model_dim)
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_ratio, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. this originates from Karpathy's experiments.
         self.lm_head = nn.Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        
+        # scaling param to un-limit the range for the final probability distribution (see page 2)
+        self.s_z = Scale(next_multiple_of_n(vocab_size, n=128), scale = 1./math.sqrt(model_dim))
         # initializing params to specific distributions
         self.apply(self.__init__weights)
 
@@ -227,18 +217,19 @@ class GPT(nn.Module):
             return causal_mask & document_mask
         doc_causal_mask = create_block_mask(document_causal, B=None, H=None, Q_LEN=input_seq.size(0), KV_LEN=input_seq.size(0))
       
-        x = x0 = norm(self.embed(input_seq)[None])
+        x = self.embed(input_seq)[None]
 
         for i in range(len(self.blocks)):
             x = self.blocks[i](x, doc_causal_mask)
 
-        x = norm(x)
         logits = self.lm_head(x).float()
+        # to un-limit the temperature of the final probability distribution (see page 2)
+        scaled_logits = logits * self.s_z()
         
         if target_seq is None:
-            return logits
+            return scaled_logits
         else:
-            return F.cross_entropy(logits.view(-1, logits.size(-1)), target_seq, 
+            return F.cross_entropy(scaled_logits.view(-1, logits.size(-1)), target_seq, 
                                   reduction='sum' if self.training else 'mean')
 
     def get_num_params(self):
@@ -260,8 +251,9 @@ class GPT(nn.Module):
                 break
         
         if dim_to_normalize is not None:
-            # Normalize the weights
-            module.weight.data = norm_(module.weight.data, dim=dim_to_normalize)
+            # Normalize the weights in-place
+            norm_(module.weight.data, dim=dim_to_normalize)
+            #weight.div_(weight.norm(p=2, dim=dim_to_normalize, keepdim=True))
 
     def enforce_constraints(self):
         """
@@ -269,15 +261,16 @@ class GPT(nn.Module):
         1. Absolute value constraint on eigen learning rate parameters
         2. Cosine normalization on Linear layer weights where one dimension matches model dim
         """
-        # Enforce absolute value on eigen learning rates
-        #for layer in self.blocks:
-            #layer.alpha_A.s.data.abs_()
-            #layer.alpha_M.s.data.abs_() # TODO un-comment once scales are addeed back in
-        
-        # Cosine normalize relevant Linear layers
-        for module in self.modules():
-            if isinstance(module, (nn.Linear, nn.Embedding)):
-                self.normalize_linear(module)
+        with torch.no_grad():
+            # Enforce absolute value on eigen learning rates
+            for layer in self.blocks:
+                layer.alpha_A.s.data.abs_()
+                layer.alpha_M.s.data.abs_()
+            
+            # Cosine normalize relevant Linear layers
+            for module in self.modules():
+                if isinstance(module, (nn.Linear, nn.Embedding)):
+                    self.normalize_linear(module)
 
     @torch.no_grad()
     def generate(self, idx, max_new_tokens, temperature=1.0, top_k=None):
@@ -308,6 +301,9 @@ class GPT(nn.Module):
             probs = F.softmax(logits, dim=-1)
             # sample from the distribution
             idx_next = torch.multinomial(probs, num_samples=1)
+            while idx_next >= self.vocab_size: # don't want to grab any of the out-of-vocab tokens
+                idx_next = torch.multinomial(probs, num_samples=1)
+                # could get stuck in an infinite loop here bit that's hella unlikely & i'm lazy
             # append sampled index to the running sequence and continue
             idx[min(seq_len, self.max_seq_len)] = idx_next
 
@@ -385,8 +381,8 @@ class Hyperparameters:
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 16*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
-    val_seq_len = 16*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
+    train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
+    val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
     num_iterations = 10 # number of iterations to run
     lr_init = 0.001
@@ -394,9 +390,9 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     # model size - setup for GPUs w/ 8GB of VRAM
-    num_layers = 6  
-    num_heads = 4   
-    model_dim = 256  
+    num_layers = 6
+    num_heads = 6
+    model_dim = 384
     head_dim = None  # if None, will be set to model_dim // num_heads
     mlp_ratio = int(4 * 2/3) # 2/3 to make the GLU number of parameters eqiuvalent to not GLU
     # evaluation and logging
@@ -411,7 +407,6 @@ class Hyperparameters:
         assert self.mlp_ratio > 0, f"mlp_ratio must be positive, got {self.mlp_ratio}"
         assert self.train_seq_len % 128 == 0, f"train_seq_len must be multiple of 128, got {self.train_seq_len}"
         assert self.val_seq_len % 128 == 0, f"val_seq_len must be multiple of 128, got {self.val_seq_len}"
-        assert self.num_layers >= 6, f"num_layers must be greater than 6 because of value embedding structure, got {self.num_layers}"
 
 args = Hyperparameters()
 
@@ -474,7 +469,7 @@ model: nn.Module = GPT(vocab_size=args.vocab_size,
                        model_dim=args.model_dim,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len),
                        mlp_ratio=args.mlp_ratio).cuda()
-print0(f'{model.get_num_params()} parameters')
+print0(f'{model.get_num_params()} parameters', console=True)
 print0(model)
 
 for param in model.parameters():
@@ -490,7 +485,6 @@ def get_lr(step: int): # TODO add warmup for regular GPT
     return max(cosine_decay, args.lr_final / args.lr_init)
 
 # Use a more memory-efficient compilation option
-# Disable torch.compile for now as it's causing tensor dimension issues
 model: nn.Module = torch.compile(model, dynamic=False, mode="reduce-overhead")
 
 # Add fallback mode to handle compilation errors
@@ -632,6 +626,14 @@ dist.destroy_process_group()
 
 # Then at the end of training:
 if master_process:
+    # check to make sure abs val & cos norm actually worked
+    # checking to make sure the absolute value-ing worked
+    print0("-"*10 + " making sure assertions worked " + "-"*10, console=True)
+    print0(model.blocks[0].alpha_A.s.data[0,:5], console=True)
+    # checking to make sure the cosine normalization worked
+    print0(model.blocks[0].mlp.Wup.weight.norm(dim=1)[:5], console=True)
+    print0(model.embed.weight.norm(dim=1)[:5], console=True)
+
     prompts = [
         "Once upon a time,",
         "The meaning of life is",
