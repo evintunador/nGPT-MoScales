@@ -154,16 +154,23 @@ class MLP(nn.Module):
         hidden = u * F.silu(v) # (batch_size, seq_len, hidden_dim)
         return self.Wdown(hidden) # (batch_size, seq_len, output_dim)
 
-
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, layer_idx: int):
         super().__init__()
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim, mlp_ratio)
 
+        self.alpha_A = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
+            # not sure what scale to use with a_A and a_M. At one point i had it as 1./math.sqrt(cfg.dim)
+            # but now i can't find the reference to that in the paper
+        # eigen learning rate vector
+        self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
+
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x = x + self.attn(norm(x), block_mask)
-        x = x + self.mlp(norm(x))
+        x_A = self.attn(x, block_mask)
+        x = norm(x + self.alpha_A() * (x_A - x))
+        x_M = self.mlp(x)
+        x = norm(x + self.alpha_M() * (x_M - x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -386,12 +393,12 @@ class Hyperparameters:
     lr_final = 0.0001
     # architecture
     vocab_size = 50257
-    # model size - new parameters for GPUs w/ at least 8GB VRAM during testing
-    num_layers = 6  # 124m param model should be 12
-    num_heads = 4   # 124m param model should be 6
-    model_dim = 256  # must be divisible by num_heads
+    # model size - setup for GPUs w/ 8GB of VRAM
+    num_layers = 6  
+    num_heads = 4   
+    model_dim = 256  
     head_dim = None  # if None, will be set to model_dim // num_heads
-    mlp_ratio = 4  # 124m param model should be 4
+    mlp_ratio = int(4 * 2/3) # 2/3 to make the GLU number of parameters eqiuvalent to not GLU
     # evaluation and logging
     val_loss_every = 100 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
