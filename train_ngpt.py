@@ -17,6 +17,7 @@ import math
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 import torch
 torch.empty(1, device="cuda", requires_grad=True).backward() # prevents a bug on some systems
+torch.set_float32_matmul_precision('high')
 from torch import Tensor, nn
 import torch.nn.functional as F
 import torch.distributed as dist
@@ -30,8 +31,38 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_
 from kernels.cos_norm import cosine_norm_triton, cosine_norm_triton_
 norm = cosine_norm_triton
 norm_ = cosine_norm_triton_
-#def norm(x: Tensor):
-    #return F.rms_norm(x, (x.size(-1),))
+"""
+def norm(x: Tensor):
+    return F.rms_norm(x, (x.size(-1),))
+def cosine_norm(x: torch.Tensor, dim=-1) -> torch.Tensor:
+    # calculate the magnitude of the vectors
+    norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-6)
+    # divide by the magnitude to place on the unit hypersphere
+    return x / norm
+"""
+
+class Scale(nn.Module):
+    """
+    A module that manages learnable scaling parameters to ensure different learning rates
+    from the rest of the parameters in the model (see pages 5 and 19)
+    
+    Args:
+        dim (int): Dimension of the scaling parameter
+        scale (float): Initial scale value
+        init (float): Initial value for the scaling parameter
+        device (str, optional): Device to store the parameter on
+    """
+    def __init__(self, dim: int, heads: int = 1, scale: float = 1.0, init: float = 1.0):
+        super().__init__()
+        self.init = init
+        self.scale = scale
+        self.s = nn.Parameter(torch.ones(heads, dim) * scale)
+            # heads == 1 gives us a single regular vector
+            # heads > 1 gets used in attention mechanism for different scaling vector for each head
+    
+    def forward(self):
+        """Compute the effective scaling factor."""
+        return self.s * (self.init / self.scale) # shape (heads, dim)
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -62,30 +93,39 @@ class CausalSelfAttention(nn.Module):
         # Calculate head_dim based on model dimensions and num_heads
         self.num_heads = num_heads
         # If head_dim not specified, calculate it based on the model dimension
-        if head_dim is None:
-            head_dim = dim // num_heads
-        self.head_dim = head_dim
-        hdim = num_heads * head_dim
-        std = 0.5 * (dim ** -0.5)
-        bound = (3 ** 0.5) * std # improved init scale by @YouJiacheng
-        # merged QKV weights: suggested by many, implemented by @fernbear.bsky.social, and further improved by @YouJiacheng
-        # https://x.com/hi_tysam/status/1879699187107033311
-        self.qkv_w = nn.Parameter(torch.empty(3, hdim, dim).uniform_(-bound, bound))
-        self.rotary = Rotary(head_dim, max_seq_len)
-        self.c_proj = nn.Linear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.head_dim = dim // num_heads if head_dim is None else head_dim
+        self.Wq = nn.Linear(dim, num_heads * self.head_dim, bias=False)
+        self.Wk = nn.Linear(dim, num_heads * self.head_dim, bias=False)
+        self.Wv = nn.Linear(dim, num_heads * self.head_dim, bias=False)
+        # the scaling factor to apply to the normalized queries & keys (see page 4)
+        self.s_qk = Scale(self.head_dim, heads=num_heads, scale = 1. / math.sqrt(dim))
+        # the scaling factor to apply to the attention logits to restore a variance of 1 (see page 4)
+        self.scale = self.head_dim ** 0.5
+        self.rotary = Rotary(self.head_dim, max_seq_len)
+        self.Wo = nn.Linear(num_heads * self.head_dim, dim, bias=False)
 
     def forward(self, x: Tensor, block_mask: BlockMask):
         B, T = x.size(0), x.size(1) # batch size, sequence length
         assert B == 1, "Must use batch size = 1 for FlexAttention"
-        q, k, v = F.linear(x, self.qkv_w.flatten(end_dim=1).type_as(x)).view(B, T, 3 * self.num_heads, self.head_dim).chunk(3, dim=-2)
-        q, k = norm(q), norm(k) # QK norm @Grad62304977
+        # Linear projections for queries, keys, and values
+        q, k, v = self.Wq(x), self.Wk(x), self.Wv(x)
+            # shape: (batch_size, seq_len, dim) -> (batch_size, seq_len, num_heads * head_dim)
+        # Reshape projections to separate heads
+        q = q.view(B, T, self.num_heads, self.head_dim)
+        k = k.view(B, T, self.num_heads, self.head_dim)
+        v = v.view(B, T, self.num_heads, self.head_dim)
+        # normalizing & scaling our queries  & keys (see page 4)
+        s_qk = self.s_qk() # (num_heads, head_dim)
+        q = norm(q) * s_qk # then scale each head
+        k = norm(k) * s_qk # no shape change
+        # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
-        # scale the attention logits by given constant, instead of the default head_dim**-0.5, by @leloykun
-        # inspired by learnable scalars used by @brendanh0gan https://x.com/hi_tysam/status/1879693583898591283
+        # the meat of the attention calculation
         y = flex_attention(q.transpose(1, 2), k.transpose(1, 2), v.transpose(1, 2), block_mask=block_mask, scale=0.12).transpose(1, 2)
+        # combine heads
         y = y.contiguous().view(B, T, self.num_heads * self.head_dim) # re-assemble all head outputs side by side
-        y = self.c_proj(y)
+        # mix heads
+        y = self.Wo(y)
         return y
 
 class MLP(nn.Module):
@@ -128,7 +168,34 @@ class GPT(nn.Module):
         self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_ratio, max_seq_len, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. this originates from Karpathy's experiments.
         self.lm_head = nn.Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
-        #self.lm_head.weight.detach().zero_()
+        
+        # initializing params to specific distributions
+        self.apply(self.__init__weights)
+
+    def __init__weights(self, module):
+        """
+        parameter initialization isn't actually important in N-GPT because of the normalization
+        However we'll still initialize according to how they did in appendix A.5
+        """
+        # whereas GPT-2 used std = 0.02, we'll do square root of model's embedding dimension
+        std = math.sqrt(self.model_dim) 
+
+        if isinstance(module, (nn.Linear, nn.Parameter)):
+            # specific weight matrices at the end of each layer are given smaller std 
+            # originally this was done in GPT-2 to keep the residual stream small
+            if hasattr(module, 'GPT_scale_init'):
+                std *= (2 * len(self.blocks)) ** -0.5
+
+            # carries out the actual initialization
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
+
+            # biases, if any, should instead be initialized to zeros
+            if module.bias is not None:
+                torch.nn.init.zeros_(module.bias) 
+
+        # the embedding matrix doesn't count as an nn.Linear so we've gotta do it again for that
+        elif isinstance(module, nn.Embedding):
+            torch.nn.init.normal_(module.weight, mean=0.0, std=std)
 
     def forward(self, input_seq: Tensor, target_seq: Tensor = None):
         assert input_seq.ndim == 1
@@ -293,6 +360,7 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
 
 @dataclass
 class Hyperparameters:
+    kernels = True
     # data
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
