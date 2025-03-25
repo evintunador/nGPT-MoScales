@@ -102,8 +102,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, self.head_dim)
         # normalizing & scaling our queries  & keys (see page 4)
         s_qk = self.s_qk() # (num_heads, head_dim)
-        q = cosine_norm_triton(q, dim=-1) * s_qk # then scale each head
-        k = cosine_norm_triton(k, dim=-1) * s_qk # no shape change
+        q = cosine_norm_triton(q) * s_qk # then scale each head
+        k = cosine_norm_triton(k) * s_qk # no shape change
         # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
         # the meat of the attention calculation
@@ -153,10 +153,10 @@ class Block(nn.Module):
         self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x_A = cosine_norm_triton(self.attn(x, block_mask), dim=-1)
-        x = cosine_norm_triton(x + self.alpha_A() * (x_A - x), dim=-1)
-        x_M = cosine_norm_triton(self.mlp(x), dim=-1)
-        x = cosine_norm_triton(x + self.alpha_M() * (x_M - x), dim=-1)
+        x_A = cosine_norm_triton(self.attn(x, block_mask))
+        x = cosine_norm_triton(x + self.alpha_A() * (x_A - x))
+        x_M = cosine_norm_triton(self.mlp(x))
+        x = cosine_norm_triton(x + self.alpha_M() * (x_M - x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -250,7 +250,7 @@ class GPT(nn.Module):
         
         if dim_to_normalize is not None:
             # Normalize the weights in-place
-            cosine_norm_triton__(module.weight.data, dim=dim_to_normalize)
+            cosine_norm_triton_(module.weight.data, dim=dim_to_normalize)
 
     def enforce_constraints(self):
         """
@@ -381,7 +381,7 @@ class Hyperparameters:
     train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
     val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 10 # number of iterations to run
+    num_iterations = 200 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture

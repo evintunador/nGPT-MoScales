@@ -105,7 +105,7 @@ sram_per_sm = properties["max_shared_mem"]
 
 class _cosine_norm_triton(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x):
+    def forward(ctx, x, dim: int = -1):
         # we know this function will only be used on dim=-1 in nGPT
         M, N = x.reshape(-1, x.shape[-1]).shape
 
@@ -141,7 +141,7 @@ class _cosine_norm_triton(torch.autograd.Function):
             BLOCK_SIZE=block_size
         )
 
-        return dLdx
+        return dLdx, None
 
 cosine_norm_triton = _cosine_norm_triton.apply
 
