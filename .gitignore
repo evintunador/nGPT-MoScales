@@ -172,3 +172,7 @@ cython_debug/
 
 # PyPI configuration file
 .pypirc
+
+# repo specific
+data/finewebedu10B/
+data/hellaswag/
