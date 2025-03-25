@@ -63,7 +63,7 @@ def cos_norm_fwd(
     norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
     y = x / norm
 
-    tl.store(norm_ptr, norm)
+    #tl.store(norm_ptr, norm)
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
 @triton.jit
@@ -83,10 +83,14 @@ def cos_norm_bwd(
     mask = cols < N
 
     x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    #y = tl.load(y_ptr + cols, mask=mask, other=0.).to(tl.float32)
     dLdy = tl.load(dLdy_ptr + cols, mask=mask, other=0.).to(tl.float32)
-    norm = tl.load(norm_ptr) # fp32
+    #norm = tl.load(norm_ptr) # fp32
 
     # compute grad
+    eps: tl.constexpr = 1e-12
+    inf: tl.constexpr = 1e12
+    norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
     y = x / norm
     dLdy_dot_y = tl.sum(y * dLdy, axis=0)
     dLdx = (dLdy - y * dLdy_dot_y) / norm
@@ -142,7 +146,30 @@ class _cosine_norm_triton(torch.autograd.Function):
 cosine_norm_triton = _cosine_norm_triton.apply
 
 
-def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
+
+@triton.jit
+def cos_norm_fwd_inplace(
+    x_ptr,
+    stride_M, stride_N,
+    N,
+    BLOCK_SIZE: tl.constexpr
+):
+    row = tl.program_id(0)
+    x_ptr += row * stride_M
+    cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
+    mask = cols < N
+
+    x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
+
+    # compute L_2 norm & normalize
+    eps: tl.constexpr = 1e-12
+    inf: tl.constexpr = 1e12
+    norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
+    y = x / norm
+
+    tl.store(x_ptr + cols, y.to(x_ptr.type.element_ty), mask=mask)
+
+def cosine_norm_triton_(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """In-place version of cosine_norm_triton forward pass following PyTorch naming convention"""
     # we know this function will only be used on dim=-1 in nGPT
     M, N = x.reshape(-1, x.shape[-1]).shape
@@ -153,11 +180,8 @@ def cosine_norm_triton_(x: torch.Tensor) -> torch.Tensor:
     assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
     # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
-    # kernel requires we pre-allocate tensor to store norms for backward pass # TODO make inplace separate kernel
-    _ = torch.empty((M,), dtype=torch.float32, device=x.device, requires_grad=False)
-
     # each row gets it own PID
-    cos_norm_fwd[(M,)](x, x, _, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
+    cos_norm_fwd_inplace[(M,)](x, x.stride(-2), x.stride(-1), N, BLOCK_SIZE=block_size)
 
     return x
 
@@ -211,9 +235,9 @@ for mode in ["fwd", "bwd"]:
                 x_names=['N'],
                 x_vals=[2 ** i for i in range(8, previous_power_two(sram_per_sm // dtype_bytes))], 
                 line_arg='provider',
-                line_vals=['triton', 'torch', 'naive'],
-                line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'],
-                styles=[('blue', '-'), ('green', '-'), ('red', '-')],
+                line_vals=['triton', 'torch', 'naive'] + (['inplace'] if mode == "fwd" else []),
+                line_names=['Triton', 'torch.nn.functional', 'naive + torch.compile'] + (['inplace triton'] if mode == "fwd" else []),
+                styles=[('blue', '-'), ('green', '-'), ('red', '-')] + ([('orange', '-')] if mode == "fwd" else []),
                 ylabel='GB/s',
                 plot_name=f'cos_norm_{mode}_fp{8*dtype_bytes}',
                 args={"mode": mode, "dtype_bytes": dtype_bytes}, 
@@ -223,7 +247,7 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
     # create data
     assert dtype_bytes in [2, 4]
     dtype = torch.float16 if dtype_bytes == 2 else torch.float32
-    x = torch.randn((32*1024, N), dtype=dtype, device=device, requires_grad=True)
+    x = torch.randn((16*1024, N), dtype=dtype, device=device, requires_grad=True)
 
     # confidence itnerval for testing
     quantiles = [0.5, 0.001, 0.999]
@@ -234,6 +258,8 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
         fn = lambda: cosine_norm_forward_naive(x)
     if provider == "triton":
         fn = lambda: cosine_norm_triton(x)
+    if provider == "inplace":
+        fn = lambda: cosine_norm_triton_(x)
     elif mode == "bwd":
         y = fn()
         dLdy = torch.randn_like(y)
