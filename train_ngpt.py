@@ -132,15 +132,28 @@ class MLP(nn.Module):
     def __init__(self, dim: int, mlp_ratio: int = 4):
         super().__init__()
         hdim = int(mlp_ratio * dim)
-        self.c_fc = nn.Linear(dim, hdim)
-        self.c_proj = nn.Linear(hdim, dim)
-        self.c_proj.weight.detach().zero_() # zero init suggested by @Grad62304977
+        self.Wup = nn.Linear(dim, hdim, bias=False)
+        self.Wgate = nn.Linear(dim, hdim, bias=False)
+        self.Wdown = nn.Linear(hdim, dim, bias=False)
+        # this flag designates Wdown to have a different parameter initialization as defined in model.py
+        self.Wdown.GPT_scale_init = 1 
+        # the learnable scaling factors
+        self.s_u = Scale(hdim)
+        self.s_v = Scale(hdim)
+        # the varaince-controlling scaling term, needed to benefit from SiLU (see appendix A.1)
+        self.scale = math.sqrt(dim)
 
     def forward(self, x: Tensor):
-        x = self.c_fc(x)
-        x = F.relu(x).square() # https://arxiv.org/abs/2109.08668v2; ~1-2% better than GELU; suggested by @SKYLINEZ007 and @Grad62304977
-        x = self.c_proj(x)
-        return x
+        # our up & gate projections
+        u = self.Wup(x) # (batch_size, seq_len, hidden_dim)
+        v = self.Wgate(x)
+        # scale them
+        u = u * self.s_u()
+        v = v * self.s_v() * self.scale 
+        # now perform the nonlinearity gate
+        hidden = u * F.silu(v) # (batch_size, seq_len, hidden_dim)
+        return self.Wdown(hidden) # (batch_size, seq_len, output_dim)
+
 
 class Block(nn.Module):
     def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, layer_idx: int):
