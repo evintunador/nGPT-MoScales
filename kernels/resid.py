@@ -152,7 +152,7 @@ def cos_norm_bwd(x, dLdy, eps: tl.constexpr, inf: tl.constexpr):
 def resid_bwd_kernel(
     h_ptr, dLdh_ptr,
     h_eigen_ptr, dLdh_eigen_ptr,
-    alpha_ptr, dLdalpha_ptr,
+    alpha_ptr, dLdalpha_pre_ptr,
     out_ptr, dLdout_ptr,
     stride_M, stride_N,
     N,
@@ -166,6 +166,8 @@ def resid_bwd_kernel(
     dLdh_eigen_ptr += offset
     out_ptr += offset
     dLdout_ptr += offset
+    # this is where we'll accumulate each PID's contribution to dLdalpha
+    dLdalpha_pre_ptr += offset
 
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
@@ -192,14 +194,45 @@ def resid_bwd_kernel(
     # bwd the residual conection
     dLdh = dLdresidual * (1 - alpha)
     dLdh_eigen_normed = dLdresidual * alpha
-    dLdalpha = dLdresidual * (h_eigen_normed - h)
+    dLdalpha_contribution = dLdresidual * (h_eigen_normed - h)
 
     # bwd the pre-norm
     dLdh_eigen = cos_norm_bwd(h_eigen, dLdh_eigen_normed, eps, inf)
 
     tl.store(dLdh_ptr + cols, dLdh.to(dLdh_ptr.type.element_ty), mask=mask)
     tl.store(dLdh_eigen_ptr + cols, dLdh_eigen.to(dLdh_eigen_ptr.type.element_ty), mask=mask)
-    tl.atomic_add(dLdalpha_ptr + cols, dLdalpha.to(dLdalpha_ptr.type.element_ty), mask=mask)
+    tl.store(dLdalpha_pre_ptr + cols, dLdalpha_contribution.to(dLdalpha_pre_ptr.type.element_ty), mask=mask)
+
+@triton.autotune(
+    [
+        triton.Config(
+            {"BLOCK_SIZE_M": BLOCK_SIZE_M, "BLOCK_SIZE_N": BLOCK_SIZE_N},
+        )
+        for BLOCK_SIZE_M in [16, 32, 64, 128]
+        for BLOCK_SIZE_N in [16, 32, 64, 128]
+    ],
+    key=["N"],
+)
+@triton.jit
+def dLdalpha_kernel(
+    dLdalpha_pre_ptr, dLdalpha_ptr, 
+    stride_M, stride_N, 
+    M, N: tl.constexpr, 
+    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr
+):
+    pid = tl.program_id(0)
+    rows = tl.arange(0, BLOCK_SIZE_M)
+    cols = pid * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
+    cols_mask = cols < N
+    acc = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_N], dtype=tl.float32)
+    for i in tl.range(0, M, BLOCK_SIZE_M):
+        mask = (rows[:, None] < M) & cols_mask[None, :]
+        offsets = rows[:, None] * stride_M + cols[None, :] * stride_N
+        dLdalpha_contribution = tl.load(dLdalpha_pre_ptr + offsets, mask=mask, other=0.)
+        acc += dLdalpha_contribution
+        rows += BLOCK_SIZE_M
+    dLdalpha = tl.sum(acc, axis=0)
+    tl.store(dLdalpha_ptr + cols, dLdalpha, mask=cols_mask)
 
 #@triton_op("mylib::resid_bwd_triton", mutates_args={})
 def resid_bwd_triton(ctx, dLdout):
@@ -209,13 +242,21 @@ def resid_bwd_triton(ctx, dLdout):
     
     dLdh = torch.empty_like(h)
     dLdh_eigen = torch.empty_like(h_eigen)
-    dLdalpha = torch.zeros_like(alpha)
+    dLdalpha_pre = torch.empty_like(h)
+    dLdalpha = torch.empty_like(alpha)
 
     wrap_triton(resid_bwd_kernel)[(M,)](
-        h, dLdh, h_eigen, dLdh_eigen, alpha, dLdalpha, out, dLdout,
+        h, dLdh, h_eigen, dLdh_eigen, alpha, dLdalpha_pre, out, dLdout,
         h.stride(-2), h.stride(-1),
         N,
         block_size
+    )
+
+    grid = lambda args: (triton.cdiv(N, args["BLOCK_SIZE_N"]),)
+    wrap_triton(dLdalpha_kernel)[grid](
+        dLdalpha_pre, dLdalpha,
+        dLdalpha_pre.stride(-2), dLdalpha_pre.stride(-1),
+        M, N,
     )
 
     return dLdh, dLdh_eigen, dLdalpha
