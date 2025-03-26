@@ -43,7 +43,7 @@ def fused_logits_fwd(
     stride_a_M, stride_a_K, 
     stride_b_K, stride_b_N, 
     stride_c_M, stride_c_N, 
-    stride_s,
+    stride_s_N,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, 
 ):
@@ -69,15 +69,14 @@ def fused_logits_fwd(
         mask = offsets_K < K - k * BLOCK_SIZE_K
         a = tl.load(a_ptr + a_offsets, mask=mask[None, :], other=0.0).to(tl.float32) # shape (BLOCK_SIZE_M, BLOCK_SIZE_K)
         b = tl.load(b_ptr + b_offsets, mask=mask[:, None], other=0.0).to(tl.float32) # shape (BLOCK_SIZE_K, BLOCK_SIZE_N)
-        # we accumulate along the K dimension
         accumulator = tl.dot(a, b, acc=accumulator)
         # advance the pointers to the next block along K
         a_offsets += BLOCK_SIZE_K * stride_a_K
         b_offsets += BLOCK_SIZE_K * stride_b_K
 
     # entry-wise multiply by scale factor
-    s = tl.load(s_ptr + offsets_N * stride_s, mask=offsets_N < N).to(tl.float32)
-    accumulator = accumulator * s[None, :]
+    s = tl.load(s_ptr + offsets_N * stride_s_N, mask=offsets_N < N).to(tl.float32)
+    accumulator *= s[None, :]
 
     # write back the block of the output matrix C with masks
     c_offsets = stride_c_M * offsets_M[:, None] + stride_c_N * offsets_N[None, :]
