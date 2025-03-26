@@ -13,11 +13,10 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 @torch.compile
 def cosine_norm_forward_naive(x: torch.Tensor, dim: int = -1) -> torch.Tensor:
     """Places vectors onto the unit-hypersphere"""
-    with torch.no_grad():
-        # calculate the magnitude of the vectors
-        norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
-        # divide by the magnitude to place on the unit hypersphere
-        return x / norm
+    # calculate the magnitude of the vectors
+    norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
+    # divide by the magnitude to place on the unit hypersphere
+    return x / norm
 
 @torch.compile
 def cosine_norm_backward_naive(x: torch.Tensor, grad_output: torch.Tensor, dim: int = -1) -> torch.Tensor:
@@ -26,17 +25,16 @@ def cosine_norm_backward_naive(x: torch.Tensor, grad_output: torch.Tensor, dim: 
     The gradient is: grad_input = (grad_output - y * sum(y * grad_output)) / norm
     where y is the normalized output.
     """
-    with torch.no_grad():
-        norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
-        y = x / norm
-        
-        # Compute sum(y * grad_output) along specified dimension
-        grad_dot_y = torch.sum(y * grad_output, dim=dim, keepdim=True)
-        
-        # Compute the gradient
-        grad_input = (grad_output - y * grad_dot_y) / norm
-        
-        return grad_input
+    norm = torch.norm(x, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
+    y = x / norm
+    
+    # Compute sum(y * grad_output) along specified dimension
+    grad_dot_y = torch.sum(y * grad_output, dim=dim, keepdim=True)
+    
+    # Compute the gradient
+    grad_input = (grad_output - y * grad_dot_y) / norm
+    
+    return grad_input
 
 
 @triton.jit

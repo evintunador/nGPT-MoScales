@@ -26,7 +26,11 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-from kernels.cos_norm import cosine_norm_triton, cosine_norm_triton_
+from kernels.cos_norm import cosine_norm_triton_ as cosine_norm_inplace_
+from kernels.cos_norm import cosine_norm_triton as cosine_norm
+#from kernels.resid import resid_fwd_naive as resid
+from kernels.resid import resid_fwd_triton as resid
+#from kernels.resid import resid_fwd_frankenstein as resid # out of VRAM error bc of bwd
 
 class Scale(nn.Module):
     """
@@ -43,7 +47,7 @@ class Scale(nn.Module):
         super().__init__()
         self.init = init
         self.scale = scale
-        self.s = nn.Parameter(torch.ones(heads, dim) * scale)
+        self.s = nn.Parameter((torch.ones(heads, dim) if heads > 1 else torch.ones(dim)) * scale)
             # heads == 1 gives us a single regular vector
             # heads > 1 gets used in attention mechanism for different scaling vector for each head
     
@@ -102,8 +106,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, self.head_dim)
         # normalizing & scaling our queries  & keys (see page 4)
         s_qk = self.s_qk() # (num_heads, head_dim)
-        q = cosine_norm_triton(q) * s_qk # then scale each head
-        k = cosine_norm_triton(k) * s_qk # no shape change
+        q = cosine_norm(q) * s_qk # then scale each head
+        k = cosine_norm(k) * s_qk # no shape change
         # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
         # the meat of the attention calculation
@@ -153,10 +157,12 @@ class Block(nn.Module):
         self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x_A = cosine_norm_triton(self.attn(x, block_mask))
-        x = cosine_norm_triton(x + self.alpha_A() * (x_A - x))
-        x_M = cosine_norm_triton(self.mlp(x))
-        x = cosine_norm_triton(x + self.alpha_M() * (x_M - x))
+        #x_A = cosine_norm(self.attn(x, block_mask))
+        #x = cosine_norm(x + self.alpha_A() * (x_A - x))
+        x = resid(x, self.attn(x, block_mask), self.alpha_A())
+        #x_M = cosine_norm(self.mlp(x))
+        #x = cosine_norm(x + self.alpha_M() * (x_M - x))
+        x = resid(x, self.mlp(x), self.alpha_M())
         return x
 
 # -----------------------------------------------------------------------------
@@ -250,7 +256,7 @@ class GPT(nn.Module):
         
         if dim_to_normalize is not None:
             # Normalize the weights in-place
-            cosine_norm_triton_(module.weight.data, dim=dim_to_normalize)
+            cosine_norm_inplace_(module.weight.data, dim=dim_to_normalize)
 
     def enforce_constraints(self):
         """
@@ -626,7 +632,7 @@ if master_process:
     # check to make sure abs val & cos norm actually worked
     # checking to make sure the absolute value-ing worked
     print0("-"*10 + " making sure assertions worked " + "-"*10, console=True)
-    print0(model.blocks[0].alpha_A.s.data[0,:5], console=True)
+    print0(model.blocks[0].alpha_A.s.data[:5], console=True)
     # checking to make sure the cosine normalization worked
     print0(model.blocks[0].mlp.Wup.weight.norm(dim=1)[:5], console=True)
     print0(model.embed.weight.norm(dim=1)[:5], console=True)

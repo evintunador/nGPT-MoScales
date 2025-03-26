@@ -9,6 +9,9 @@ import torch.nn.functional as F
 import torch._dynamo
 torch._dynamo.config.cache_size_limit = 64  # Increase from default of 8
 
+# fixes issue w frankenstein not keeping autograd graph during benchmark
+torch._functorch.config.donated_buffer=False
+
 import triton
 import triton.language as tl
 
@@ -16,7 +19,10 @@ from torch.library import triton_op, wrap_triton
 
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
-from cos_norm import cosine_norm_forward_naive, cosine_norm_backward_naive
+try:
+    from .cos_norm import cosine_norm_forward_naive, cosine_norm_backward_naive
+except Exception as e:
+    from cos_norm import cosine_norm_forward_naive, cosine_norm_backward_naive
 
 @torch.compile
 def resid_fwd_naive(h, h_eigen, alpha):
@@ -44,25 +50,28 @@ def resid_bwd_naive(h, h_eigen, alpha, grad_output):
         grad_h_eigen: gradient for h_eigen
         grad_alpha: gradient for alpha
     """
-    with torch.no_grad():
-        # Forward pass computations we need
-        h_eigen_normed = cosine_norm_forward_naive(h_eigen)
-        residual = h + alpha * (h_eigen_normed - h)
-        
-        # Backward pass through the final normalization
-        grad_residual = cosine_norm_backward_naive(residual, grad_output)
-        
-        # Gradients for the residual connection components
-        grad_h = grad_residual * (1 - alpha)
-        grad_h_eigen_normed = grad_residual * alpha
-        
-        # Backward pass through the first normalization (h_eigen)
-        grad_h_eigen = cosine_norm_backward_naive(h_eigen, grad_h_eigen_normed)
-        
-        # Compute gradient for alpha - reshape to match alpha's shape (N)
-        grad_alpha = torch.sum(grad_residual * (h_eigen_normed - h), dim=0)
+    # Forward pass computations we need
+    h_eigen_normed = cosine_norm_forward_naive(h_eigen)
+    residual = h + alpha * (h_eigen_normed - h)
+    
+    # Backward pass through the final normalization
+    grad_residual = cosine_norm_backward_naive(residual, grad_output)
+    
+    # Gradients for the residual connection components
+    grad_h = grad_residual * (1 - alpha)
+    grad_h_eigen_normed = grad_residual * alpha
+    
+    # Backward pass through the first normalization (h_eigen)
+    grad_h_eigen = cosine_norm_backward_naive(h_eigen, grad_h_eigen_normed)
+    
+    # Compute gradient for alpha - reshape to match alpha's shape (N)
+    grad_alpha = torch.sum(grad_residual * (h_eigen_normed - h), dim=0)
     
     return grad_h, grad_h_eigen, grad_alpha
+
+
+
+
 
 
 @triton.jit
@@ -107,7 +116,7 @@ sram_per_sm = properties["max_shared_mem"]
 #@torch.compile(fullgraph=True)
 @triton_op("mylib::resid_fwd_triton", mutates_args={})
 def resid_fwd_triton(h: torch.Tensor, h_eigen: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
-    assert all([x.device == DEVICE for x in [h, h_eigen, alpha]])
+    #assert all([x.device == DEVICE for x in [h, h_eigen, alpha]])
     assert h.shape == h_eigen.shape
     assert h.stride() == h_eigen.stride()
     assert alpha.shape[0] == h.shape[-1]
@@ -274,6 +283,63 @@ resid_fwd_triton.register_autograd(resid_bwd_triton, setup_context=resid_bwd_tri
 
 
 
+
+@triton_op("mylib::resid_fwd_frankenstein", mutates_args={})
+def resid_fwd_frankenstein(h: torch.Tensor, h_eigen: torch.Tensor, alpha: torch.Tensor) -> torch.Tensor:
+    #assert all([x.device == DEVICE for x in [h, h_eigen, alpha]])
+    assert h.shape == h_eigen.shape
+    assert h.stride() == h_eigen.stride()
+    assert alpha.shape[0] == h.shape[-1]
+    M, N = h.reshape(-1, h.shape[-1]).shape
+
+    # this kernel is designed for normalizing vectors that fit in SRAM
+    max_entries = sram_per_sm // h.element_size()
+    block_size = triton.next_power_of_2(N)
+    assert max_entries >= block_size, f"cosine norm kernel only supports vectors up to {max_entries}"
+    # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
+
+    # pre-allocate output
+    out = torch.empty_like(h)
+
+    wrap_triton(resid_fwd_kernel)[(M,)](
+        h, h_eigen, alpha, out,
+        h.stride(-2), h.stride(-1),
+        N,
+        BLOCK_SIZE=block_size
+    )
+
+    return out
+
+def resid_bwd_frankenstein(ctx, dLdout):
+    h, h_eigen, alpha, out = ctx.saved_tensors
+    
+    #with torch.no_grad():
+    # Forward pass computations we need
+    h_eigen_normed = cosine_norm_forward_naive(h_eigen)
+    residual = h + alpha * (h_eigen_normed - h)
+    
+    # Backward pass through the final normalization
+    dLdresidual = cosine_norm_backward_naive(residual, dLdout)
+    
+    # Gradients for the residual connection components
+    dLdh = dLdresidual * (1 - alpha)
+    dLdh_eigen_normed = dLdresidual * alpha
+    
+    # Backward pass through the first normalization (h_eigen)
+    dLdh_eigen = cosine_norm_backward_naive(h_eigen, dLdh_eigen_normed)
+    
+    # Compute gradient for alpha - reshape to match alpha's shape (N)
+    dLdalpha = torch.sum(dLdresidual * (h_eigen_normed - h), dim=0)
+
+    return dLdh, dLdh_eigen, dLdalpha
+
+def resid_bwd_frankenstein_setup_context(ctx, inputs, output):
+    h, h_eigen, alpha = inputs
+    ctx.save_for_backward(h, h_eigen, alpha, output)
+
+resid_fwd_frankenstein.register_autograd(resid_bwd_frankenstein, setup_context=resid_bwd_frankenstein_setup_context)
+
+
 def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
     """Create a heatmap visualization for gradient differences"""
     import os
@@ -354,15 +420,6 @@ def test_resid_bwd(M, N, dtype, device=DEVICE, atol=5e-2, rtol=0):
     # Gradient from upstream
     grad_output = torch.randn((M, N), dtype=dtype, device=device)
     
-    # Method 1: PyTorch autograd backward
-    # Create a differentiable version of the forward pass
-    def forward_differentiable(h, h_eigen, alpha):
-        # Same logic as resid_fwd_naive but without torch.no_grad()
-        h_eigen_normed = h_eigen / torch.clamp(torch.norm(h_eigen, dim=-1, keepdim=True), min=1e-12)
-        residual = h + alpha * (h_eigen_normed - h)
-        out = residual / torch.clamp(torch.norm(residual, dim=-1, keepdim=True), min=1e-12)
-        return out
-    
     # Clone inputs for autograd
     h_auto = h.clone().detach().requires_grad_(True)
     h_eigen_auto = h_eigen.clone().detach().requires_grad_(True)
@@ -372,7 +429,7 @@ def test_resid_bwd(M, N, dtype, device=DEVICE, atol=5e-2, rtol=0):
     alpha_tri = alpha.clone().detach().requires_grad_(True)
     
     # Forward pass
-    output_auto = forward_differentiable(h_auto, h_eigen_auto, alpha_auto)
+    output_auto = resid_fwd_naive(h_auto, h_eigen_auto, alpha_auto)
     output_triton = resid_fwd_triton(h_tri, h_eigen_tri, alpha_tri)
     
     # Backward pass
@@ -449,9 +506,9 @@ for mode in ["fwd", "bwd"]:
                 x_names=['N'],
                 x_vals=[2 ** i for i in range(8, previous_power_two(sram_per_sm // dtype_bytes))], 
                 line_arg='provider',
-                line_vals=['triton', 'naive'],
-                line_names=['Triton', 'naive + torch.compile'],
-                styles=[('blue', '-'), ('green', '-')],
+                line_vals=['triton', 'naive', 'frankenstein'],
+                line_names=['Triton', 'naive + torch.compile', 'Frankenstein'],
+                styles=[('blue', '-'), ('green', '-'), ('red', '-')],
                 ylabel='GB/s',
                 plot_name=f'resid_{mode}_fp{8*dtype_bytes}',
                 args={"mode": mode, "dtype_bytes": dtype_bytes}, 
@@ -472,6 +529,8 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
         fn = lambda: resid_fwd_triton(h, h_eigen, alpha)
     if provider == "naive":
         fn = lambda: resid_fwd_naive(h, h_eigen, alpha)
+    if provider == 'frankenstein':
+        fn = lambda: resid_fwd_frankenstein(h, h_eigen, alpha)
     elif mode == "bwd":
         y = fn()
         dLdy = torch.randn_like(y)
@@ -485,6 +544,7 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
 
 
 if __name__ == "__main__":
+    
     # always run unit-tests
     test_resid_fwd(64, 64, torch.float32)
     test_resid_fwd(64, 64, torch.float16)
@@ -500,6 +560,7 @@ if __name__ == "__main__":
     test_resid_bwd(2048, 768, torch.float16)
     test_resid_bwd(2048, 8192, torch.float32)
     test_resid_bwd(2048, 8192, torch.float16)
+    
 
     # Only run benchmark if explicitly requested
     import sys
