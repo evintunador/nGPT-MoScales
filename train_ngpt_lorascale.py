@@ -59,11 +59,10 @@ class LoRAScale(nn.Module):
     def __init__(self, dim, rank):
         super().__init__()
         self.up = nn.Linear(dim, rank, bias=True)
-        self.gate = nn.Linear(dim, rank, bias=True)
         self.down = nn.Linear(rank, dim, bias=True)
 
     def forward(self, x):
-        return self.down(self.up(x) * F.SiLU(self.gate(x)))
+        return self.down(F.silu(self.up(x)))
 
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
@@ -169,14 +168,12 @@ class Block(nn.Module):
         self.alpha_M = LoRAScale(dim, eigen_rank)
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        #x_A = cosine_norm(self.attn(x, block_mask))
-        #x = cosine_norm(x + self.alpha_A() * (x_A - x))
+        x_A = cosine_norm(self.attn(x, block_mask))
+        x = cosine_norm(x + self.alpha_A(x) * (x_A - x))
         #x = resid(x, self.attn(x, block_mask), self.alpha_A())
-        x = resid(x, self.attn(x, block_mask), self.alpha_A(x))
-        #x_M = cosine_norm(self.mlp(x))
-        #x = cosine_norm(x + self.alpha_M() * (x_M - x))
+        x_M = cosine_norm(self.mlp(x))
+        x = cosine_norm(x + self.alpha_M(x) * (x_M - x))
         #x = resid(x, self.mlp(x), self.alpha_M())
-        x = resid(x, self.mlp(x), self.alpha_M(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -280,9 +277,9 @@ class GPT(nn.Module):
         """
         with torch.no_grad():
             # Enforce absolute value on eigen learning rates
-            for layer in self.blocks:
-                layer.alpha_A.s.data.abs_()
-                layer.alpha_M.s.data.abs_()
+            #for layer in self.blocks:
+                #layer.alpha_A.s.data.abs_()
+                #layer.alpha_M.s.data.abs_()
             
             # Cosine normalize relevant Linear layers
             for module in self.modules():
@@ -407,7 +404,7 @@ class Hyperparameters:
     # architecture
     vocab_size = 50257
     # model size - setup for GPUs w/ 8GB of VRAM
-    num_layers = 6
+    num_layers = 4
     num_heads = 6
     model_dim = 384
     head_dim = None  # if None, will be set to model_dim // num_heads
@@ -648,7 +645,7 @@ if master_process:
     # check to make sure abs val & cos norm actually worked
     # checking to make sure the absolute value-ing worked
     print0("-"*10 + " making sure assertions worked " + "-"*10, console=True)
-    print0(model.blocks[0].alpha_A.s.data[:5], console=True)
+    #print0(model.blocks[0].alpha_A.s.data[:5], console=True)
     # checking to make sure the cosine normalization worked
     print0(model.blocks[0].mlp.Wup.weight.norm(dim=1)[:5], console=True)
     print0(model.embed.weight.norm(dim=1)[:5], console=True)
