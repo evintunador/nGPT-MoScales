@@ -400,23 +400,20 @@ def test_resid_bwd(M, N, dtype, device=DEVICE, atol=5e-2, rtol=0):
 def previous_power_two(n):
     return int(math.log(n, 2))
 
-# =============================================================================
-# Benchmark Configurations (including Frankenstein op)
-# -----------------------------------------------------------------------------
 configs = []
 for mode in ["fwd", "bwd"]:
     for dtype_bytes in [2, 4]:
         configs.append(
             triton.testing.Benchmark(
                 x_names=['N'],
-                x_vals=[2 ** i for i in range(8, previous_power_two(sram_per_sm // dtype_bytes))],
+                x_vals=[2 ** i for i in range(8, previous_power_two(sram_per_sm // dtype_bytes))], 
                 line_arg='provider',
-                line_vals=['triton', 'naive', 'frankenstein'],
-                line_names=['Triton', 'naive + torch.compile', 'Frankenstein'],
-                styles=[('blue', '-'), ('green', '-'), ('red', '-')],
+                line_vals=['triton', 'naive'],
+                line_names=['Triton', 'naive + torch.compile'],
+                styles=[('blue', '-'), ('green', '-')],
                 ylabel='GB/s',
                 plot_name=f'resid_{mode}_fp{8*dtype_bytes}',
-                args={"mode": mode, "dtype_bytes": dtype_bytes},
+                args={"mode": mode, "dtype_bytes": dtype_bytes}, 
             ))
 @triton.testing.perf_report(configs)
 def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
@@ -434,8 +431,6 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
         fn = lambda: resid_fwd_triton(h, h_eigen, alpha)
     if provider == "naive":
         fn = lambda: resid_fwd_naive(h, h_eigen, alpha)
-    if provider == "frankenstein":
-        fn = lambda: resid_frankenstein(h, h_eigen, alpha)
     elif mode == "bwd":
         y = fn()
         dLdy = torch.randn_like(y)
@@ -447,76 +442,9 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
     return gbps(ms), gbps(max_ms), gbps(min_ms)
 
 
-# =============================================================================
-# Frankenstein Residual Custom Op
-# -----------------------------------------------------------------------------
-# Uses Triton custom op for forward and naive+torch.compile for backward.
-# =============================================================================
-class ResidFrankensteinOp(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, h, h_eigen, alpha):
-        # Use Triton kernel for forward pass
-        out = resid_fwd_triton(h, h_eigen, alpha)
-        ctx.save_for_backward(h, h_eigen, alpha, out)
-        return out
-
-    @staticmethod
-    def backward(ctx, grad_output):
-        h, h_eigen, alpha, out = ctx.saved_tensors
-        # Use the naive backward pass (compiled via torch.compile) for gradients
-        grad_h, grad_h_eigen, grad_alpha = resid_bwd_naive(h, h_eigen, alpha, grad_output)
-        return grad_h, grad_h_eigen, grad_alpha
-
-def resid_frankenstein(h, h_eigen, alpha):
-    """Wrapper for the Frankenstein residual operation"""
-    return ResidFrankensteinOp.apply(h, h_eigen, alpha)
-
-
-# =============================================================================
-# Frankenstein Operation Tests
-# -----------------------------------------------------------------------------
-# A lightweight unit-test for the Frankenstein op that:
-# 1. Compares its forward pass against the naive op.
-# 2. Runs a backward pass to ensure gradients propagate.
-# 3. Checks that the computed gradients match the expected values from the naive backward.
-# =============================================================================
-def test_resid_frankenstein(M, N, dtype, device=DEVICE, atol=1e-3, rtol=1e-3):
-    # Create data with gradients enabled
-    h = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
-    h_eigen = torch.randn((M, N), dtype=dtype, device=device, requires_grad=True)
-    alpha = torch.randn(N, dtype=dtype, device=device, requires_grad=True)
-
-    # Clone inputs for backward gradient verification
-    h_clone = h.detach().clone().requires_grad_(True)
-    h_eigen_clone = h_eigen.detach().clone().requires_grad_(True)
-    alpha_clone = alpha.detach().clone().requires_grad_(True)
-
-    # Forward pass: Frankenstein op vs. naive op
-    out_frank = resid_frankenstein(h, h_eigen, alpha)
-    out_naive = resid_fwd_naive(h, h_eigen, alpha)
-    torch.testing.assert_close(out_frank, out_naive, atol=atol, rtol=rtol)
-
-    # Backward pass: trigger gradient computation for Frankenstein op
-    grad_output = torch.randn((M, N), dtype=dtype, device=device)
-    out_frank.backward(grad_output)
-
-    # Compute expected gradients using the naive backward function on cloned inputs
-    grad_h_expected, grad_h_eigen_expected, grad_alpha_expected = resid_bwd_naive(
-        h_clone, h_eigen_clone, alpha_clone, grad_output
-    )
-
-    # Compare gradients from Frankenstein op backward with expected gradients
-    torch.testing.assert_close(h.grad, grad_h_expected, atol=atol, rtol=rtol)
-    torch.testing.assert_close(h_eigen.grad, grad_h_eigen_expected, atol=atol, rtol=rtol)
-    torch.testing.assert_close(alpha.grad, grad_alpha_expected, atol=atol, rtol=rtol)
-
-    print(f"✓ passed Frankenstein op test (M={M}, N={N}, dtype={dtype})")
-
 
 if __name__ == "__main__":
-    # ===============================
-    # Unit Tests: Forward & Backward Ops
-    # ===============================
+    # always run unit-tests
     test_resid_fwd(64, 64, torch.float32)
     test_resid_fwd(64, 64, torch.float16)
     test_resid_fwd(2048, 768, torch.float32)
@@ -524,22 +452,15 @@ if __name__ == "__main__":
     test_resid_fwd(2048, 8192, torch.float32)
     test_resid_fwd(2048, 8192, torch.float16)
 
+    # Run backward tests
     test_resid_bwd(64, 64, torch.float32)
     test_resid_bwd(64, 64, torch.float16)
     test_resid_bwd(2048, 768, torch.float32)
     test_resid_bwd(2048, 768, torch.float16)
     test_resid_bwd(2048, 8192, torch.float32)
     test_resid_bwd(2048, 8192, torch.float16)
-    
-    # ===============================
-    # Unit Test: Frankenstein Op
-    # ===============================
-    test_resid_frankenstein(64, 64, torch.float32)
-    test_resid_frankenstein(64, 64, torch.float16)
-    test_resid_frankenstein(2048, 768, torch.float32)
-    test_resid_frankenstein(2048, 768, torch.float16)
 
-    # Only run benchmark if explicitly requested.
+    # Only run benchmark if explicitly requested
     import sys
     if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
         benchmark.run(save_path='./benchmarks/', print_data=False)
