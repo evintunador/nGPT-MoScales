@@ -181,10 +181,10 @@ def resid_bwd_kernel(
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
 
-    h = tl.load(h_ptr + cols, mask=mask, other=0.).to(tl.float64)
-    h_eigen = tl.load(h_eigen_ptr + cols, mask=mask, other=0.).to(tl.float64)
-    dLdout = tl.load(dLdout_ptr + cols, mask=mask, other=0.).to(tl.float64)
-    alpha = tl.load(alpha_ptr + cols, mask=mask, other=0.).to(tl.float64)
+    h = tl.load(h_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    h_eigen = tl.load(h_eigen_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    dLdout = tl.load(dLdout_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    alpha = tl.load(alpha_ptr + cols, mask=mask, other=0.).to(tl.float32)
 
     # compute L_2 norm & normalize h_eigen
     eps: tl.constexpr = 1e-12
@@ -193,9 +193,6 @@ def resid_bwd_kernel(
 
     # movement along hypersphere residual connection
     residual = h + (alpha * (h_eigen_normed - h))
-
-    # normalize output
-    out, residual_norm = cos_norm_fwd(residual, eps, inf)
 
     # bwd the post-norm
     dLdresidual = cos_norm_bwd(residual, dLdout, eps, inf)

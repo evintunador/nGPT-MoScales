@@ -4,6 +4,14 @@ import torch
 #print(torch.__version__)
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.library import triton_op, wrap_triton
+
+# lets us cache a ton of different kernels when benchmarking
+import torch._dynamo
+torch._dynamo.config.cache_size_limit = 64  # Increase from default of 8
+
+# fixes issue w frankenstein not keeping autograd graph during benchmark
+torch._functorch.config.donated_buffer=False
 
 import triton
 import triton.language as tl
@@ -61,7 +69,7 @@ def cos_norm_fwd(
     norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
     y = x / norm
 
-    #tl.store(norm_ptr, norm)
+    tl.store(norm_ptr, norm)
     tl.store(y_ptr + cols, y.to(y_ptr.type.element_ty), mask=mask)
 
 @triton.jit
@@ -72,35 +80,43 @@ def cos_norm_bwd(
     BLOCK_SIZE: tl.constexpr
 ):
     row = tl.program_id(0)
-    x_ptr += row * stride_M
-    dLdx_ptr += row * stride_M
-    y_ptr += row * stride_M
-    dLdy_ptr += row * stride_M
+    offset = row * stride_M
+    #x_ptr += offset
+    dLdx_ptr += offset
+    y_ptr += offset
+    dLdy_ptr += offset
     norm_ptr += row
     cols = tl.arange(0, BLOCK_SIZE) * stride_N # stride since we never asserted x.is_contiguous()
     mask = cols < N
 
-    x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
-    #y = tl.load(y_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    #x = tl.load(x_ptr + cols, mask=mask, other=0.).to(tl.float32)
+    y = tl.load(y_ptr + cols, mask=mask, other=0.).to(tl.float32)
     dLdy = tl.load(dLdy_ptr + cols, mask=mask, other=0.).to(tl.float32)
-    #norm = tl.load(norm_ptr) # fp32
+    norm = tl.load(norm_ptr) # fp32
 
     # compute grad
-    eps: tl.constexpr = 1e-12
-    inf: tl.constexpr = 1e12
-    norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
-    y = x / norm
+    #eps: tl.constexpr = 1e-12
+    #inf: tl.constexpr = 1e12
+    #norm = tl.clamp(tl.sqrt(tl.sum(x * x, axis=0)), eps, inf)
+    #y = x / norm
     dLdy_dot_y = tl.sum(y * dLdy, axis=0)
     dLdx = (dLdy - y * dLdy_dot_y) / norm
     
-    tl.store(dLdx_ptr + cols, dLdx.to(x_ptr.type.element_ty), mask=mask)
+    tl.store(dLdx_ptr + cols, dLdx.to(dLdx_ptr.type.element_ty), mask=mask)
 
 
 
 # used to derive our block size
 properties = triton.runtime.driver.active.utils.get_device_properties(DEVICE.index)
 sram_per_sm = properties["max_shared_mem"]
-
+"""
+# Pre-compile the optimized backward function outside the class
+@torch.compile
+def _cos_norm_backward_torch(y, norm, dLdy):
+    grad_dot_y = torch.sum(y * dLdy, dim=-1, keepdim=True)
+    dLdx = (dLdy - y * grad_dot_y) / norm.unsqueeze(-1)
+    return dLdx
+#"""
 class _cosine_norm_triton(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, dim: int = -1):
@@ -128,21 +144,20 @@ class _cosine_norm_triton(torch.autograd.Function):
     def backward(ctx, dLdy):
         x, y, norm = ctx.saved_tensors
         M, N, block_size = ctx.M, ctx.N, ctx.block_size
-
-        # pre-allocate gradient
-        dLdx = torch.empty_like(x)
         
+        #dLdx = _cos_norm_backward_torch(y, norm, dLdy)
+        
+        dLdx = torch.empty_like(x)
         cos_norm_bwd[(M,)](
             x, dLdx, y, dLdy, norm,
             x.stride(-2), x.stride(-1),
             N,
             BLOCK_SIZE=block_size
         )
-
+        
         return dLdx, None
 
 cosine_norm_triton = _cosine_norm_triton.apply
-
 
 
 @triton.jit
@@ -261,10 +276,7 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
     elif mode == "bwd":
         y = fn()
         dLdy = torch.randn_like(y)
-        if provider == "naive":
-            fn = lambda: cosine_norm_backward_naive(x, dLdy)
-        else:
-            fn = lambda: y.backward(dLdy, retain_graph=True)
+        fn = lambda: y.backward(dLdy, retain_graph=True)
     
     # benchmark
     ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
@@ -274,10 +286,10 @@ def benchmark(N, provider, mode, dtype_bytes, device=DEVICE):
 
 if __name__ == "__main__":
     # always run unit-tests
-    test_cos_norm(2048, 768, torch.float16)
-    test_cos_norm(2048, 8192, torch.float16)
     test_cos_norm(2048, 768, torch.float32)
     test_cos_norm(2048, 8192, torch.float32)
+    test_cos_norm(2048, 768, torch.float16)
+    test_cos_norm(2048, 8192, torch.float16)
 
     # Only run benchmark if explicitly requested
     import sys
