@@ -379,7 +379,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
 
 @dataclass
 class Hyperparameters:
-    kernels = True
     # data
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
@@ -387,7 +386,7 @@ class Hyperparameters:
     train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
     val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 200 # number of iterations to run
+    num_iterations = 10_000 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture
@@ -808,6 +807,6 @@ if master_process:
     # Check if the HellaSwag data file exists
     if os.path.exists(hellaswag_path):
         print0(f"Found HellaSwag dataset at {hellaswag_path}, running evaluation...", console=True)
-        evaluate_hellaswag(model, hellaswag_path, limit=20)
+        evaluate_hellaswag(model, hellaswag_path, limit=500)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)

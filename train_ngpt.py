@@ -376,7 +376,6 @@ def distributed_data_generator(filename_pattern: str, batch_size: int, rank: int
 
 @dataclass
 class Hyperparameters:
-    kernels = True
     # data
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
@@ -805,6 +804,6 @@ if master_process:
     # Check if the HellaSwag data file exists
     if os.path.exists(hellaswag_path):
         print0(f"Found HellaSwag dataset at {hellaswag_path}, running evaluation...", console=True)
-        evaluate_hellaswag(model, hellaswag_path, limit=20)
+        evaluate_hellaswag(model, hellaswag_path, limit=500)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
