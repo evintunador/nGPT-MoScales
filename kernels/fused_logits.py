@@ -111,11 +111,11 @@ def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
     import os
     import numpy as np
     import matplotlib.pyplot as plt
-    heatmap_path = f'./resid_{test_name}_heatmap.png'
+    heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
     
     # Convert to numpy arrays
-    actual_np = actual.detach().cpu().numpy()
     expected_np = expected.detach().cpu().numpy()
+    actual_np = actual.detach().cpu().numpy()
     
     # Compute differences and masks
     abs_diff = np.abs(expected_np - actual_np)
@@ -153,7 +153,9 @@ def test(M, N, K, dtype, device=DEVICE, atol=1e-3, rtol=1e-3):
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
         print(f"✗ failed test (M={M}, N={N}, K={K}, dtype={dtype})")
-        create_diff_heatmap(C_naive, C_triton, M, N, dtype, "fwd", atol)
+        print(C_naive)
+        print(C_triton)
+        create_diff_heatmap(C_naive, C_triton, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e
 
 if __name__ == "__main__":
