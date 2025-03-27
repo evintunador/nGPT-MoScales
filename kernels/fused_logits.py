@@ -27,6 +27,14 @@ def fused_logits_naive(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> tor
     assert s.shape[0] == B.shape[-1]
     return (A @ B) * s
 
+@torch.compile
+def fused_logits_naive_bwd(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor, dLdD) -> torch.Tensor:
+    C = A @ B
+    dLdC = dLdD * s
+    dLds = torch.sum(dLdD * C, axis=0)
+    dLdA = dLdC @ B.T
+    dLdB = A.T @ dLdC
+    return dLdA, dLdB, dLds
 
 autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
@@ -152,7 +160,7 @@ def fused_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> to
 
 def fused_logits_triton_bwd(ctx, dLdC):
     A, B, s, C = ctx.saved_tensors
-    M, N, K = ctx.M, ctx.N, ctx.k
+    M, N, K = ctx.M, ctx.N, ctx.K
 
     dLdA = torch.empty_like(A)
     dLdB = torch.empty_like(B)
@@ -237,21 +245,21 @@ def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
     print(f"Created error heatmap at {heatmap_path}")
 
 def test(M, N, K, dtype, device=DEVICE, atol=5e-2, rtol=0):
-    A_naive = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
-    B_naive = torch.randn((K, N), dtype=dtype, device=device, requires_grad=True)
-    s_naive = torch.randn((N,), dtype=dtype, device=device, requires_grad=True)
+    A_torch = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    B_torch = torch.randn((K, N), dtype=dtype, device=device, requires_grad=True)
+    s_torch = torch.randn((N,), dtype=dtype, device=device, requires_grad=True)
 
-    A_triton = A_naive.clone().detach().requires_grad_(True) 
-    B_triton = B_naive.clone().detach().requires_grad_(True)
-    s_triton = s_naive.clone().detach().requires_grad_(True)
+    A_triton = A_torch.clone().detach().requires_grad_(True) 
+    B_triton = B_torch.clone().detach().requires_grad_(True)
+    s_triton = s_torch.clone().detach().requires_grad_(True)
 
-    C_naive = fused_logits_naive(A_naive, B_naive, s_naive)
-    C_triton = fused_logits_triton(A_triton, B_triton, s_triton)
+    D_torch = fused_logits_naive(A_torch, B_torch, s_torch)
+    D_triton = fused_logits_triton(A_triton, B_triton, s_triton)
 
     import os
     test_name = f"C_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(C_naive, C_triton, atol=atol, rtol=rtol)
+        torch.testing.assert_close(D_torch, D_triton, atol=atol, rtol=rtol)
         print(f"✓ passed fwd test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -259,54 +267,96 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-2, rtol=0):
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
         print(f"✗ failed test (M={M}, N={N}, K={K}, dtype={dtype})")
-        print(A_naive)
-        print(B_naive)
-        print(C_naive)
-        print(C_triton)
-        create_diff_heatmap(C_naive, C_triton, M, N, dtype, test_name, atol)
+        print(A_torch)
+        print(B_torch)
+        print(D_torch)
+        print(D_triton)
+        create_diff_heatmap(D_torch, D_triton, M, N, dtype, test_name, atol)
         raise e
+    
+    dLdD = torch.randn_like(D_torch)
+    D_torch.backward(dLdD)
+    dLdA_naive, dLdB_naive, dLds_naive = fused_logits_naive_bwd(A_torch, B_torch, s_torch, dLdD)
+
+    test_name = f"dLdA_naive_M={M},N={N}_{dtype}"
+    try:
+        torch.testing.assert_close(A_torch.grad, dLdA_naive, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdA_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        if os.path.exists(heatmap_path):
+            os.remove(heatmap_path)
+            print(f"Deleted old heatmap file: {heatmap_path}")
+    except AssertionError as e:
+        print(f"✗ failed dLdA_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(A_torch.grad, dLdA_naive, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        raise e
+
+    test_name = f"dLdB_naive_M={M},N={N}_{dtype}"
+    try:
+        torch.testing.assert_close(B_torch.grad, dLdB_naive, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        if os.path.exists(heatmap_path):
+            os.remove(heatmap_path)
+            print(f"Deleted old heatmap file: {heatmap_path}")
+    except AssertionError as e:
+        print(f"✗ failed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(B_torch.grad, dLdB_naive, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        raise e
+
+    test_name = f"dLdB_naive_M={M},N={N}_{dtype}"
+    try:
+        torch.testing.assert_close(s_torch.grad, dLds_naive, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        if os.path.exists(heatmap_path):
+            os.remove(heatmap_path)
+            print(f"Deleted old heatmap file: {heatmap_path}")
+    except AssertionError as e:
+        print(f"✗ failed dLds_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(s_torch.grad, dLds_naive, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        raise e
+
     """
-    dLdC = torch.randn_like(C_naive)
-    C_naive.backward(dLdC)
-    C_triton.backward(dLdC)
+    D_triton.backward(dLdD)
 
-    test_name = f"dLdA_M={M},N={N}_{dtype}"
+    test_name = f"dLdA_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(A_naive.grad, A_triton.grad, atol=atol, rtol=rtol)
-        print(f"✓ passed dLdA test (M={M}, N={N}, K={K}, dtype={dtype})")
+        torch.testing.assert_close(A_torch.grad, A_triton.grad, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdA_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
-        print(f"✗ failed dLdA test (M={M}, N={N}, K={K}, dtype={dtype})")
-        create_diff_heatmap(A_naive.grad, A_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        print(f"✗ failed dLdA_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(A_torch.grad, A_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e
 
-    test_name = f"dLdB_M={M},N={N}_{dtype}"
+    test_name = f"dLdB_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(B_naive.grad, B_triton.grad, atol=atol, rtol=rtol)
-        print(f"✓ passed dLdB test (M={M}, N={N}, K={K}, dtype={dtype})")
+        torch.testing.assert_close(B_torch.grad, B_triton.grad, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdB_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
-        print(f"✗ failed dLdB test (M={M}, N={N}, K={K}, dtype={dtype})")
-        create_diff_heatmap(B_naive.grad, B_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        print(f"✗ failed dLdB_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(B_torch.grad, B_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e
 
-    test_name = f"dLdB_M={M},N={N}_{dtype}"
+    test_name = f"dLdB_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(s_naive.grad, s_triton.grad, atol=atol, rtol=rtol)
-        print(f"✓ passed dLdB test (M={M}, N={N}, K={K}, dtype={dtype})")
+        torch.testing.assert_close(s_torch.grad, s_triton.grad, atol=atol, rtol=rtol)
+        print(f"✓ passed dLdB_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
-        print(f"✗ failed dLds test (M={M}, N={N}, K={K}, dtype={dtype})")
-        create_diff_heatmap(s_naive.grad, s_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
+        print(f"✗ failed dLds_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
+        create_diff_heatmap(s_torch.grad, s_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e"""
 
 if __name__ == "__main__":
