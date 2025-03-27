@@ -159,9 +159,6 @@ def fused_logits_triton_bwd(ctx, dLdC):
     locks = torch.zeros(2 * LOCK_GROUP_SIZE, dtype=torch.int32, device=A.device)
 
     grid_dLdA = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(K, meta['BLOCK_SIZE_K']),)
-    grid_dLdB = lambda meta: (triton.cdiv(K, meta['BLOCK_SIZE_K']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
-    grid_dLds = (triton.cdiv())
-
     wrap_triton(fused_logits_dLdA)[grid_dLdA](
         A, B, C, 
         dLdA, dLdB, dLdC, 
@@ -174,25 +171,29 @@ def fused_logits_triton_bwd(ctx, dLdC):
         s.stride(0),
         dLds_parts.stride(0), dLds_parts.stride(1)
     )
+
+    grid_dLdB = lambda meta: (triton.cdiv(K, meta['BLOCK_SIZE_K']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
     wrap_triton(fused_logits_dLdB)[grid_dLdB](
         A, B, C, 
         dLdA, dLdB, dLdC, 
         s, dLds_parts, dLds,
         locks,
-        M, N, K, 
+        M, N, K,
         A.stride(0), A.stride(1), 
         B.stride(0), B.stride(1), 
         C.stride(0), C.stride(1), 
         s.stride(0),
         dLds_parts.stride(0), dLds_parts.stride(1)
     )
+
+    grid_dLds = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_N'),)
     wrap_triton(fused_logits_dLds)[grid_dLds](
         dLds_parts, dLds,
         N, 
         dLds_parts.stride(0), dLds_parts.stride(1),
     )
 
-    return
+    return dLdA, dLdB, dLds
 
 def fused_logits_triton_setup_ctx(ctx, inputs, output):
     A, B, s = inputs
