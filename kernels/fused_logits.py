@@ -22,13 +22,13 @@ import triton.language as tl
 DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 
 @torch.compile
-def fused_logits_naive(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def scaled_logits_naive(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     assert A.shape[-1] == B.shape[-2]
     assert s.shape[0] == B.shape[-1]
     return (A @ B) * s
 
 @torch.compile
-def fused_logits_naive_bwd(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor, dLdD) -> torch.Tensor:
+def scaled_logits_naive_bwd(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor, dLdD) -> torch.Tensor:
     C = A @ B
     dLdC = dLdD * s
     dLds = torch.sum(dLdD * C, axis=0)
@@ -52,7 +52,7 @@ autotune_configs = [
 ]
 @triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
-def fused_logits_fwd(
+def scaled_logits_fwd(
     a_ptr, b_ptr, d_ptr, s_ptr,
     M, N, K, 
     stride_a_M, stride_a_K, 
@@ -113,7 +113,7 @@ autotune_configs = [
 ]
 @triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
-def fused_logits_dLdA(
+def scaled_logits_dLdA(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
     s_ptr, dLds_parts_ptr, dLds_ptr,
@@ -175,7 +175,7 @@ autotune_configs = [
 ]
 @triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
-def fused_logits_dLdB(
+def scaled_logits_dLdB(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
     s_ptr, dLds_parts_ptr, dLds_ptr,
@@ -236,7 +236,7 @@ autotune_configs = [
 ]
 @triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
 @triton.jit
-def fused_logits_dLds_p1(
+def scaled_logits_dLds_p1(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
     s_ptr, dLds_parts_ptr, dLds_ptr,
@@ -304,7 +304,7 @@ def fused_logits_dLds_p1(
     key=["ROWS", "COLS"],
 )
 @triton.jit
-def fused_logits_dLds_p2(
+def scaled_logits_dLds_p2(
     dLds_parts_ptr, dLds_ptr,
     stride_dLds_parts_ROW, stride_dLds_parts_COL,
     stride_dLds_COL,
@@ -328,7 +328,7 @@ def fused_logits_dLds_p2(
     tl.store(dLds_ptr + offsets_COL * stride_dLds_COL, dLds, mask=mask_COL)
 
 @triton_op("mylib::logits_fused", mutates_args={})
-def fused_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+def scaled_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     """
     A @ B = C
     C * s = D
@@ -341,7 +341,7 @@ def fused_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> to
     (M, K), (_, N) = A.reshape(-1, A.shape[-1]).shape, B.reshape(-1, B.shape[-1]).shape
     D = torch.empty((M, N), device=A.device, dtype=A.dtype)
     grid = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
-    wrap_triton(fused_logits_fwd)[grid](
+    wrap_triton(scaled_logits_fwd)[grid](
         A, B, D, s,
         M, N, K,
         A.stride(0), A.stride(1),
@@ -350,11 +350,11 @@ def fused_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> to
         s.stride(0)
     )
     # Save config for backward pass
-    best_config = getattr(fused_logits_fwd, "best_config", None)
+    best_config = getattr(scaled_logits_fwd, "best_config", None)
     _block_size_m = best_config.kwargs['BLOCK_SIZE_M']
     return D
 
-def fused_logits_triton_bwd(ctx, dLdD):
+def scaled_logits_triton_bwd(ctx, dLdD):
     global _block_size_m
     A, B, s, D = ctx.saved_tensors
     M, N, K = ctx.M, ctx.N, ctx.K
@@ -375,7 +375,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
     locks = torch.zeros(2 * max_blocks_m, dtype=torch.int32, device=A.device)
 
     grid_dLdA = lambda meta: (triton.cdiv(M, meta['BLOCK_SIZE_M']) * triton.cdiv(K, meta['BLOCK_SIZE_K']),)
-    wrap_triton(fused_logits_dLdA)[grid_dLdA](
+    wrap_triton(scaled_logits_dLdA)[grid_dLdA](
         A, B, D, 
         dLdA, dLdB, dLdD, 
         s, dLds_parts, dLds,
@@ -389,7 +389,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
     )
 
     grid_dLdB = lambda meta: (triton.cdiv(K, meta['BLOCK_SIZE_K']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
-    wrap_triton(fused_logits_dLdB)[grid_dLdB](
+    wrap_triton(scaled_logits_dLdB)[grid_dLdB](
         A, B, D, 
         dLdA, dLdB, dLdD, 
         s, dLds_parts, dLds,
@@ -403,7 +403,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
     )
     
     grid_dLds_p1 = lambda meta: (triton.cdiv(M, _block_size_m) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
-    wrap_triton(fused_logits_dLds_p1)[grid_dLds_p1](
+    wrap_triton(scaled_logits_dLds_p1)[grid_dLds_p1](
         A, B, D, 
         dLdA, dLdB, dLdD, 
         s, dLds_parts, dLds,
@@ -417,7 +417,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
         BLOCK_SIZE_M = _block_size_m
     )
     grid_dLds_p2 = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_ROWS']),)
-    wrap_triton(fused_logits_dLds_p2)[grid_dLds_p2](
+    wrap_triton(scaled_logits_dLds_p2)[grid_dLds_p2](
         dLds_parts, dLds,
         dLds_parts.stride(0), dLds_parts.stride(1),
         dLds.stride(0),
@@ -426,13 +426,13 @@ def fused_logits_triton_bwd(ctx, dLdD):
 
     return dLdA, dLdB, dLds
 
-def fused_logits_triton_setup_ctx(ctx, inputs, output):
+def scaled_logits_triton_setup_ctx(ctx, inputs, output):
     A, B, s = inputs
     ctx.save_for_backward(A, B, s, output)
     (M, K), (_, N) = A.reshape(-1, A.shape[-1]).shape, B.reshape(-1, B.shape[-1]).shape
     ctx.M, ctx.N, ctx.K = M, N, K
 
-fused_logits_triton.register_autograd(fused_logits_triton_bwd, setup_context=fused_logits_triton_setup_ctx)
+scaled_logits_triton.register_autograd(scaled_logits_triton_bwd, setup_context=scaled_logits_triton_setup_ctx)
 
 
 def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
@@ -440,7 +440,7 @@ def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
     import os
     import numpy as np
     import matplotlib.pyplot as plt
-    heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+    heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
     
     # Convert to numpy arrays
     expected_np = expected.detach().cpu().numpy()
@@ -469,8 +469,8 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
     B_triton = B_torch.clone().detach().requires_grad_(True)
     s_triton = s_torch.clone().detach().requires_grad_(True)
 
-    D_torch = fused_logits_naive(A_torch, B_torch, s_torch)
-    D_triton = fused_logits_triton(A_triton, B_triton, s_triton)
+    D_torch = scaled_logits_naive(A_torch, B_torch, s_torch)
+    D_triton = scaled_logits_triton(A_triton, B_triton, s_triton)
 
     ### fwd test
     import os
@@ -481,7 +481,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             D_triton / D_triton.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed fwd test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -494,7 +494,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
     
     dLdD = torch.randn_like(D_torch)
     D_torch.backward(dLdD)
-    dLdA_naive, dLdB_naive, dLds_naive = fused_logits_naive_bwd(A_torch, B_torch, s_torch, dLdD)
+    dLdA_naive, dLdB_naive, dLds_naive = scaled_logits_naive_bwd(A_torch, B_torch, s_torch, dLdD)
 
     ### naive implementation bwd tests
     test_name = f"dLdA_naive_M={M},N={N}_{dtype}"
@@ -504,7 +504,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             dLdA_naive / dLdA_naive.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLdA_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -520,7 +520,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             dLdB_naive / dLdB_naive.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -536,7 +536,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             dLds_naive / dLds_naive.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLds_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -556,7 +556,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             A_triton.grad / A_triton.grad.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLdA_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -574,7 +574,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             B_triton.grad / B_triton.grad.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLdB_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -592,7 +592,7 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
             s_triton.grad / s_triton.grad.std(), 
             atol=atol, rtol=rtol)
         print(f"✓ passed dLds_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
-        heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
+        heatmap_path = f'./scaled_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
             os.remove(heatmap_path)
             print(f"Deleted old heatmap file: {heatmap_path}")
@@ -603,16 +603,116 @@ def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
         create_diff_heatmap(s_torch.grad.unsqueeze(0), s_triton.grad.unsqueeze(0), 1, N, dtype, f"fwd_N={N}_{dtype}", atol)
         raise e
 
+
+
+configs = []
+for mode in ["fwd", "bwd"]:
+    for dtype_bytes in [2, 4]:
+        configs.append(
+            triton.testing.Benchmark(
+                x_names=['M', 'N', 'K'],
+                x_vals=[2**i in range(8, 15)], 
+                line_arg='provider',
+                line_vals=['triton', 'torch'],
+                line_names=['Triton', 'naive + torch.compile'],
+                styles=[('blue', '-'), ('green', '-')],
+                ylabel='TFLOPs',
+                plot_name=f'scaled_logits_{mode}_fp{8*dtype_bytes}',
+                args={"mode": mode, "dtype_bytes": dtype_bytes}, 
+            ))
+@triton.testing.perf_report(configs)
+def benchmark(M, N, K, provider, mode, dtype_bytes, device=DEVICE):
+    # create data
+    assert dtype_bytes in [2, 4]
+    dtype = torch.float16 if dtype_bytes == 2 else torch.float32
+    A = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
+    B = torch.randn((K, N), dtype=dtype, device=device, requires_grad=True)
+    s = torch.randn((N,), dtype=dtype, device=device, requires_grad=True)
+
+    # confidence itnerval for testing
+    quantiles = [0.5, 0.001, 0.999]
+
+    if provider == "triton":
+        fn = lambda: scaled_logits_triton(A, B, s)
+    if provider == "torch":
+        fn = lambda: scaled_logits_naive(A, B, s)
+    elif mode == "bwd":
+        D = fn()
+        dLdD = torch.randn_like(D)
+        fn = lambda: D.backward(dLdD, retain_graph=True)
+    
+    # benchmark
+    ms, min_ms, max_ms = triton.testing.do_bench(fn, quantiles=quantiles)
+    flops_per_matmul = 2.0 * M * N * K
+    flops_per_mult = M * N * K
+    if mode == "fwd":
+        total_flops = flops_per_matmul + flops_per_mult
+    if mode == "bwd":
+        # theoretical if we had instantiated C in VRAM
+        total_flops = 2 * flops_per_matmul + flops_per_mult
+        # in reality in order to save VRAM our triton implementation does 
+        #total_flops = 3 * flops_per_matmul + 3 * flops_per_mult
+    tfps = lambda ms: total_flops * 1e-12 / (ms * 1e-3)
+    return tfps(ms), tfps(max_ms), tfps(min_ms)
+
+
+
+def measure_memory_usage(func, size, *args, **kwargs):
+    # Reset the memory stats on the current GPU device
+    torch.cuda.reset_peak_memory_stats()
+    # Run the function (forward, backward, etc.)
+    func(size, *args, **kwargs)
+    # Synchronize to ensure all asynchronous ops complete
+    torch.cuda.synchronize()
+    # Get the maximum memory allocated during the operation
+    peak_memory = torch.cuda.max_memory_allocated()
+    return peak_memory
+
+# Example usage with your custom kernel and PyTorch's operator:
+def run_custom_kernel(size):
+    # Replace with a call to your fused kernel
+    A = torch.randn((size, size), device='cuda', requires_grad=True, dtype=torch.float16)
+    B = torch.randn((size, size), device='cuda', requires_grad=True, dtype=torch.float16)
+    s = torch.randn((size,), device='cuda', requires_grad=True, dtype=torch.float16)
+    D = scaled_logits_triton(A, B, s)
+    D.backward(torch.randn_like(D))
+
+def run_pytorch_operator(size):
+    A = torch.randn((size, size), device='cuda', requires_grad=True, dtype=torch.float16)
+    B = torch.randn((size, size), device='cuda', requires_grad=True, dtype=torch.float16)
+    s = torch.randn((size,), device='cuda', requires_grad=True, dtype=torch.float16)
+    D = scaled_logits_naive(A, B, s)  # similar operation as a baseline
+    D.backward(torch.randn_like(D))
+
+
+
 if __name__ == "__main__":
-    test(2, 2, 2, torch.float32)
-    test(2, 2, 2, torch.float16)
-    test(32, 32, 32, torch.float32)
-    test(32, 32, 32, torch.float16)
-    test(128, 128, 128, torch.float32)
-    test(128, 128, 128, torch.float16)
-    test(512, 512, 512, torch.float32)
-    test(512, 512, 512, torch.float16)
-    # the errors at this point are so rare (0.4%) and relatively small (atol ~1e-1) that idc
-    # likely just bc I'm using a 30 series GPU which Triton always gets big floating point errors on accumulation
-    test(8*1024, 2**14, 384, torch.float32) 
-    test(8*1024, 2**14, 384, torch.float16)
+    # Only run benchmark if explicitly requested
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "--benchmark":
+        # check runtime
+        benchmark.run(save_path='./benchmarks/', print_data=False)
+
+        # measure memory usage
+        # we do runtime first so that triton's built-in benchmarking tools can worry about autotuning
+        # so that the autotuning doesn't mess with our memory estimation
+        for size in [2**i in range(8, 15)]:
+            custom_peak = measure_memory_usage(run_custom_kernel, size)
+            pytorch_peak = measure_memory_usage(run_pytorch_operator, size)
+            print(f"M,N,K={size} | Peak memory used by custom kernel: {custom_peak * 1e-6:.0f} Mb")
+            print(f"M,N,K={size} | Peak memory used by PyTorch operator: {pytorch_peak * 1e-6:.0f} Mb")
+            print(f"Memory saved: {100 * (pytorch_peak - custom_peak) / pytorch_peak:.2f}%")
+    else:
+        test(2, 2, 2, torch.float32)
+        test(2, 2, 2, torch.float16)
+        test(32, 32, 32, torch.float32)
+        test(32, 32, 32, torch.float16)
+        test(128, 128, 128, torch.float32)
+        test(128, 128, 128, torch.float16)
+        test(512, 512, 512, torch.float32)
+        test(512, 512, 512, torch.float16)
+        test(8*1024, 2**14, 384, torch.float32) 
+        test(8*1024, 2**14, 384, torch.float16)
+
+
+    
