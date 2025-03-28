@@ -25,12 +25,12 @@ DEVICE = torch.device(f'cuda:{torch.cuda.current_device()}')
 def fused_logits_naive(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
     assert A.shape[-1] == B.shape[-2]
     assert s.shape[0] == B.shape[-1]
-    return (A @ B) #* s
+    return (A @ B) * s
 
 @torch.compile
 def fused_logits_naive_bwd(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor, dLdD) -> torch.Tensor:
     C = A @ B
-    dLdC = dLdD #* s
+    dLdC = dLdD * s
     dLds = torch.sum(dLdD * C, axis=0)
     dLdA = dLdC @ B.T
     dLdB = A.T @ dLdC
@@ -93,8 +93,8 @@ def fused_logits_fwd(
         b_offsets += BLOCK_SIZE_K * stride_b_K
 
     # entry-wise multiply by scale factor
-    #s = tl.load(s_ptr + offsets_N * stride_s_N, mask=mask_N, other=1.).to(tl.float32)
-    d = c #* s[None, :]
+    s = tl.load(s_ptr + offsets_N * stride_s_N, mask=mask_N, other=1.).to(tl.float32)
+    d = c * s[None, :]
 
     # write back the block of the output matrix C with masks
     d_offsets = stride_d_M * offsets_M[:, None] + stride_d_N * offsets_N[None, :]
@@ -147,15 +147,15 @@ def fused_logits_dLdA(
 
     dLda = tl.zeros([BLOCK_SIZE_M, BLOCK_SIZE_K], dtype=tl.float32)
     for n in range(0, tl.cdiv(N, BLOCK_SIZE_N)):
-        mask_N = offsets_N < N - n * BLOCK_SIZE_N
+        mask_N = offsets_N < N
         d_mask = mask_M[:, None] & mask_N[None, :]
         bT_mask = mask_N[:, None] & mask_K[None, :]
         dLdd = tl.load(dLdd_ptr + d_offsets, mask=d_mask, other=0.0).to(tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
-        #s = tl.load(s_ptr + offsets_N, mask=mask_N, other=1.) # (BLOCK_SIZE_N)
-        dLdc = dLdd #* s[None, :] # (BLOCK_SIZE_M, BLOCK_SIZE_N)
         bT = tl.load(b_ptr + bT_offsets, mask=bT_mask, other=0.0).to(tl.float32) # (BLOCK_SIZE_N, BLOCK_SIZE_K)
-        dLda = tl.dot(dLdc, bT, acc=dLda)
-        offsets_N += BLOCK_SIZE_N * stride_s_N
+        s = tl.load(s_ptr + offsets_N, mask=mask_N, other=1.) # (BLOCK_SIZE_N)
+        dLdc = dLdd * s[None, :] # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        dLda = tl.dot(dLdc, bT, acc=dLda) # (BLOCK_SIZE_M, BLOCK_SIZE_K)
+        offsets_N += BLOCK_SIZE_N
         d_offsets += BLOCK_SIZE_N * stride_d_N
         bT_offsets += BLOCK_SIZE_N * stride_b_N
 
@@ -207,7 +207,7 @@ def fused_logits_dLdB(
     mask_K = offsets_K < K
     mask_N = offsets_N < N
 
-    #s = tl.load(s_ptr + offsets_N * stride_s_N, mask=mask_N, other=1.) # (BLOCK_SIZE_N)
+    s = tl.load(s_ptr + offsets_N * stride_s_N, mask=mask_N, other=1.) # (BLOCK_SIZE_N)
     dLdb = tl.zeros([BLOCK_SIZE_K, BLOCK_SIZE_N], dtype=tl.float32)
     for m in range(0, tl.cdiv(M, BLOCK_SIZE_M)):
         mask_M = offsets_M < M - m * BLOCK_SIZE_M
@@ -215,7 +215,7 @@ def fused_logits_dLdB(
         d_mask = mask_M[:, None] & mask_N[None, :]
         aT = tl.load(a_ptr + aT_offsets, mask=aT_mask, other=0.0).to(tl.float32) # (BLOCK_SIZE_K, BLOCK_SIZE_M)
         dLdd = tl.load(dLdd_ptr + d_offsets, mask=d_mask, other=0.0).to(tl.float32) # (BLOCK_SIZE_M, BLOCK_SIZE_N)
-        dLdc = dLdd #* s[None, :] # (BLOCK_SIZE_M, BLOCK_SIZE_N)
+        dLdc = dLdd * s[None, :] # (BLOCK_SIZE_M, BLOCK_SIZE_N)
         dLdb = tl.dot(aT, dLdc, acc=dLdb) # (BLOCK_SIZE_K, BLOCK_SIZE_N)
         aT_offsets += BLOCK_SIZE_M * stride_a_M
         d_offsets += BLOCK_SIZE_M * stride_d_M
@@ -401,7 +401,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
         s.stride(0),
         dLds_parts.stride(0), dLds_parts.stride(1)
     )
-    """
+    
     grid_dLds_p1 = lambda meta: (triton.cdiv(M, _block_size_m) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
     wrap_triton(fused_logits_dLds_p1)[grid_dLds_p1](
         A, B, D, 
@@ -422,7 +422,7 @@ def fused_logits_triton_bwd(ctx, dLdD):
         dLds_parts.stride(0), dLds_parts.stride(1),
         dLds.stride(0),
         ROWS=max_blocks_m, COLS=N,
-    )"""
+    )
 
     return dLdA, dLdB, dLds
 
@@ -460,7 +460,7 @@ def create_diff_heatmap(expected, actual, M, N, dtype, test_name, atol):
     plt.close()
     print(f"Created error heatmap at {heatmap_path}")
 
-def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
+def test(M, N, K, dtype, device=DEVICE, atol=2e-2, rtol=0):
     A_torch = torch.randn((M, K), dtype=dtype, device=device, requires_grad=True)
     B_torch = torch.randn((K, N), dtype=dtype, device=device, requires_grad=True)
     s_torch = torch.randn((N,), dtype=dtype, device=device, requires_grad=True)
@@ -472,10 +472,14 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
     D_torch = fused_logits_naive(A_torch, B_torch, s_torch)
     D_triton = fused_logits_triton(A_triton, B_triton, s_triton)
 
+    ### fwd test
     import os
     test_name = f"C_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(D_torch, D_triton, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            D_torch / D_torch.std(), # scale all assertions to variance of 1 so that tolerances make sense
+            D_triton / D_triton.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed fwd test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -483,8 +487,6 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
             print(f"Deleted old heatmap file: {heatmap_path}")
     except AssertionError as e:
         print(f"✗ failed fwd test (M={M}, N={N}, K={K}, dtype={dtype})")
-        print(A_torch)
-        print(B_torch)
         print(D_torch)
         print(D_triton)
         create_diff_heatmap(D_torch, D_triton, M, N, dtype, test_name, atol)
@@ -494,9 +496,13 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
     D_torch.backward(dLdD)
     dLdA_naive, dLdB_naive, dLds_naive = fused_logits_naive_bwd(A_torch, B_torch, s_torch, dLdD)
 
+    ### naive implementation bwd tests
     test_name = f"dLdA_naive_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(A_torch.grad, dLdA_naive, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            A_torch.grad / A_torch.grad.std(), 
+            dLdA_naive / dLdA_naive.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLdA_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -509,7 +515,10 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
 
     test_name = f"dLdB_naive_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(B_torch.grad, dLdB_naive, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            B_torch.grad / B_torch.grad.std(), 
+            dLdB_naive / dLdB_naive.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -519,10 +528,13 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
         print(f"✗ failed dLdB_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
         create_diff_heatmap(B_torch.grad, dLdB_naive, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e
-    """
+    
     test_name = f"dLds_naive_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(s_torch.grad, dLds_naive, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            s_torch.grad / s_torch.grad.std(), 
+            dLds_naive / dLds_naive.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLds_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -531,14 +543,18 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
     except AssertionError as e:
         print(f"✗ failed dLds_naive test (M={M}, N={N}, K={K}, dtype={dtype})")
         create_diff_heatmap(s_torch.grad.unsqueeze(0), dLds_naive.unsqueeze(0), 1, N, dtype, f"fwd_N={N}_{dtype}", atol)
-        raise e"""
+        raise e
 
     
     D_triton.backward(dLdD)
 
+    ### triton implementation bwd tests
     test_name = f"dLdA_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(A_torch.grad, A_triton.grad, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            A_torch.grad / A_torch.grad.std(), 
+            A_triton.grad / A_triton.grad.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLdA_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -553,7 +569,10 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
 
     test_name = f"dLdB_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(B_torch.grad, B_triton.grad, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            B_torch.grad / B_torch.grad.std(), 
+            B_triton.grad / B_triton.grad.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLdB_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -565,10 +584,13 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
         print(B_torch.grad)
         create_diff_heatmap(B_torch.grad, B_triton.grad, M, N, dtype, f"fwd_M={M},N={N}_{dtype}", atol)
         raise e
-"""
+
     test_name = f"dLds_triton_M={M},N={N}_{dtype}"
     try:
-        torch.testing.assert_close(s_torch.grad, s_triton.grad, atol=atol, rtol=rtol)
+        torch.testing.assert_close(
+            s_torch.grad / s_torch.grad.std(), 
+            s_triton.grad / s_triton.grad.std(), 
+            atol=atol, rtol=rtol)
         print(f"✓ passed dLds_triton test (M={M}, N={N}, K={K}, dtype={dtype})")
         heatmap_path = f'./fused_logits_{test_name}_heatmap.png'
         if os.path.exists(heatmap_path):
@@ -579,16 +601,18 @@ def test(M, N, K, dtype, device=DEVICE, atol=5e-1, rtol=0):
         print(s_torch.grad)
         print(s_triton.grad)
         create_diff_heatmap(s_torch.grad.unsqueeze(0), s_triton.grad.unsqueeze(0), 1, N, dtype, f"fwd_N={N}_{dtype}", atol)
-        raise e"""
+        raise e
 
 if __name__ == "__main__":
     test(2, 2, 2, torch.float32)
     test(2, 2, 2, torch.float16)
     test(32, 32, 32, torch.float32)
     test(32, 32, 32, torch.float16)
-    # the errors at this point are so rare (0.4%) and relatively small (atol ~1e-1) that idc
-    # likely just bc I'm using a 30 series GPU which Triton always gets big floating point errors on
     test(128, 128, 128, torch.float32)
     test(128, 128, 128, torch.float16)
+    test(512, 512, 512, torch.float32)
+    test(512, 512, 512, torch.float16)
+    # the errors at this point are so rare (0.4%) and relatively small (atol ~1e-1) that idc
+    # likely just bc I'm using a 30 series GPU which Triton always gets big floating point errors on accumulation
     test(8*1024, 2**14, 384, torch.float32) 
     test(8*1024, 2**14, 384, torch.float16)
