@@ -24,20 +24,20 @@ except Exception as e:
     from cos_norm import cosine_norm_forward_naive, cosine_norm_backward_naive
 
 @torch.compile
-def resid_LoRAScale_naive(h_prev, h_eigen, alpha_up, alpha_down, alpha_bias):
+def resid_MoS_naive(h_prev, h_eigen, alpha):
     """
-    h_prev & h_eigen: shape (M, N) 
-    alpha_up: shape (N, R) where R << N
-    alpha_down: shape (R, N) 
-    alpha_bias: shape (N) 
+    h_prev & h_eigen: shape (B*N, D) 
+    alpha: shape (D, R) where R << D
     """
-    assert all([h_prev.shape[-1] == N for N in 
-        [h_eigen.shape[-1], alpha_up.shape[0], alpha_down.shape[1], alpha_bias.shape[0]])
-    assert alpha_up.shape[1] == alpha_down.shape[0]
+    assert h_prev.shape[-1] == h_eigen.shape[-1] and h_prev.shape[-1] == alpha.shape[0]
     h_eigen_normed = h_eigen / torch.norm(h_eigen, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
     h_grad = h_eigen_normed - h_prev
-    h_eta = ((h_prev @ alpha_up) @ alpha_down) + alpha_bias
-    h_adj = h_prev + h_eta * h_grad
+
+    probs = F.softmax(h_prev @ alpha, dim=-1) #(B, N, D) @ (D, R) -> (B, N, R)
+    scales = probs.unsqueeze(2) * alpha.T.unsqueeze(0).unsqueeze(0) # (B, N, 1, R) * (1, 1, D, R) -> (B, N, D, R)
+    eta = torch.sum(scales, dim=-1).squeeze(-1) # (B, N, D)
+
+    h_adj = h_prev + eta * h_grad
     h_out = h_adj / torch.norm(h_adj, p=2, dim=dim, keepdim=True).clamp(min=1e-12)
     return h_out
 
@@ -94,7 +94,7 @@ sram_per_sm = properties["max_shared_mem"]
 
 #@torch.compile(fullgraph=True)
 @triton_op("mylib::resid_fwd_triton", mutates_args={})
-def resid_LoRAScale(
+def resid_MoS(
     h_prev: torch.Tensor, 
     h_eigen: torch.Tensor, 
     alpha_up: torch.Tensor,
@@ -112,7 +112,7 @@ def resid_LoRAScale(
     # this kernel is designed for normalizing vectors that fit in SRAM
     max_entries = sram_per_sm // h_prev.element_size()
     block_size = triton.next_power_of_2(N)
-    assert max_entries >= block_size, f"resid LoRAScale kernel only supports vectors up to {max_entries}"
+    assert max_entries >= block_size, f"resid MoS kernel only supports vectors up to {max_entries}"
     # H100s have 256kb of SRAM per SM so this would fit a model dimension of 64 thousand at fp32, plenty
 
     # pre-allocate output
