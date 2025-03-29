@@ -55,6 +55,18 @@ class Scale(nn.Module):
         """Compute the effective scaling factor."""
         return self.s * (self.init / self.scale) # shape (heads, dim)
 
+class MoScale(nn.Module):
+    def __init__(self, dim, rank):
+        super().__init__()
+        assert rank < dim
+        self.w = nn.Linear(dim, rank, bias=True)
+
+    def forward(self, x): # (b, n, d)
+        probs = F.softmax(self.w(x), dim=-1) # (b, n, r) where r << d
+        scales = probs.unsqueeze(2) * self.w.weight.T.unsqueeze(0) # (b, n, 1, r) * (1, d, r) -> (b, n, d, r)
+        scale = torch.sum(scales, dim=-1).squeeze(-1) # (b, n, d)
+        return scale
+
 class Rotary(nn.Module):
     def __init__(self, dim: int, max_seq_len: int):
         super().__init__()
@@ -145,24 +157,26 @@ class MLP(nn.Module):
         return self.Wdown(hidden) # (batch_size, seq_len, output_dim)
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, eigen_rank: int, layer_idx: int):
         super().__init__()
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim, mlp_ratio)
 
-        self.alpha_A = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
+        #self.alpha_A = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
             # not sure what scale to use with a_A and a_M. At one point i had it as 1./math.sqrt(cfg.dim)
             # but now i can't find the reference to that in the paper
         # eigen learning rate vector
-        self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
+        #self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
+        self.alpha_A = MoScale(dim, eigen_rank)
+        self.alpha_M = MoScale(dim, eigen_rank)
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        #x_A = cosine_norm(self.attn(x, block_mask))
-        #x = cosine_norm(x + self.alpha_A() * (x_A - x))
-        x = resid(x, self.attn(x, block_mask), self.alpha_A())
-        #x_M = cosine_norm(self.mlp(x))
-        #x = cosine_norm(x + self.alpha_M() * (x_M - x))
-        x = resid(x, self.mlp(x), self.alpha_M())
+        x_A = cosine_norm(self.attn(x, block_mask))
+        x = cosine_norm(x + self.alpha_A(x) * (x_A - x))
+        #x = resid(x, self.attn(x, block_mask), self.alpha_A(x))
+        x_M = cosine_norm(self.mlp(x))
+        x = cosine_norm(x + self.alpha_M(x) * (x_M - x))
+        #x = resid(x, self.mlp(x), self.alpha_M(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -172,13 +186,13 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int, eigen_rank: int):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
         self.vocab_size = vocab_size
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_ratio, max_seq_len, i) for i in range(num_layers)])
+        self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_ratio, max_seq_len, eigen_rank, i) for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. this originates from Karpathy's experiments.
         self.lm_head = nn.Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
         # scaling param to un-limit the range for the final probability distribution (see page 2)
@@ -266,9 +280,9 @@ class GPT(nn.Module):
         """
         with torch.no_grad():
             # Enforce absolute value on eigen learning rates
-            for layer in self.blocks:
-                layer.alpha_A.s.data.abs_()
-                layer.alpha_M.s.data.abs_()
+            #for layer in self.blocks:
+                #layer.alpha_A.s.data.abs_()
+                #layer.alpha_M.s.data.abs_()
             
             # Cosine normalize relevant Linear layers
             for module in self.modules():
@@ -400,6 +414,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 100 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
+    eigen_rank = 32
 
     def __post_init__(self):
         # Validate and set derived parameters
@@ -470,7 +485,8 @@ model: nn.Module = GPT(vocab_size=args.vocab_size,
                        num_heads=args.num_heads, 
                        model_dim=args.model_dim,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len),
-                       mlp_ratio=args.mlp_ratio).cuda()
+                       mlp_ratio=args.mlp_ratio,
+                       eigen_rank=args.eigen_rank).cuda()
 print0(f'{model.get_num_params()} parameters', console=True)
 print0(model)
 
@@ -631,7 +647,7 @@ if master_process:
     # check to make sure abs val & cos norm actually worked
     # checking to make sure the absolute value-ing worked
     print0("-"*10 + " making sure assertions worked " + "-"*10, console=True)
-    print0(model.blocks[0].alpha_A.s.data[:5], console=True)
+    #print0(model.blocks[0].alpha_A.s.data[:5], console=True)
     # checking to make sure the cosine normalization worked
     print0(model.blocks[0].mlp.Wup.weight.norm(dim=1)[:5], console=True)
     print0(model.embed.weight.norm(dim=1)[:5], console=True)

@@ -157,12 +157,12 @@ class Block(nn.Module):
         self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        #x_A = cosine_norm(self.attn(x, block_mask))
-        #x = cosine_norm(x + self.alpha_A() * (x_A - x))
-        x = resid(x, self.attn(x, block_mask), self.alpha_A())
-        #x_M = cosine_norm(self.mlp(x))
-        #x = cosine_norm(x + self.alpha_M() * (x_M - x))
-        x = resid(x, self.mlp(x), self.alpha_M())
+        x_A = cosine_norm(self.attn(x, block_mask))
+        x = cosine_norm(x + self.alpha_A() * (x_A - x))
+        #x = resid(x, self.attn(x, block_mask), self.alpha_A())
+        x_M = cosine_norm(self.mlp(x))
+        x = cosine_norm(x + self.alpha_M() * (x_M - x))
+        #x = resid(x, self.mlp(x), self.alpha_M())
         return x
 
 # -----------------------------------------------------------------------------
@@ -810,3 +810,343 @@ if master_process:
         evaluate_hellaswag(model, hellaswag_path, limit=20)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
+
+
+====================================================================================================
+hellaswag.py not found
+====================================================================================================
+====================================================================================================
+Running Python 3.11.10 | packaged by conda-forge | (main, Oct 16 2024, 01:27:36) [GCC 13.3.0]
+Running PyTorch 2.6.0+cu124 compiled for CUDA 12.4
+Sat Mar 29 05:44:00 2025       
++-----------------------------------------------------------------------------------------+
+| NVIDIA-SMI 550.107.02             Driver Version: 550.107.02     CUDA Version: 12.4     |
+|-----------------------------------------+------------------------+----------------------+
+| GPU  Name                 Persistence-M | Bus-Id          Disp.A | Volatile Uncorr. ECC |
+| Fan  Temp   Perf          Pwr:Usage/Cap |           Memory-Usage | GPU-Util  Compute M. |
+|                                         |                        |               MIG M. |
+|=========================================+========================+======================|
+|   0  NVIDIA GeForce RTX 3060 Ti     On  |   00000000:04:00.0 Off |                  N/A |
+|  0%   43C    P2             41W /  200W |     434MiB /   8192MiB |     12%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+|   1  NVIDIA GeForce RTX 3060 Ti     On  |   00000000:2B:00.0 Off |                  N/A |
+|  0%   39C    P2             19W /  200W |     261MiB /   8192MiB |      6%      Default |
+|                                         |                        |                  N/A |
++-----------------------------------------+------------------------+----------------------+
+                                                                                         
++-----------------------------------------------------------------------------------------+
+| Processes:                                                                              |
+|  GPU   GI   CI        PID   Type   Process name                              GPU Memory |
+|        ID   ID                                                               Usage      |
+|=========================================================================================|
++-----------------------------------------------------------------------------------------+
+
+====================================================================================================
+44625024 parameters
+GPT(
+  (embed): Embedding(50257, 384)
+  (blocks): ModuleList(
+    (0-3): 4 x Block(
+      (attn): CausalSelfAttention(
+        (Wq): Linear(in_features=384, out_features=384, bias=False)
+        (Wk): Linear(in_features=384, out_features=384, bias=False)
+        (Wv): Linear(in_features=384, out_features=384, bias=False)
+        (s_qk): Scale()
+        (rotary): Rotary()
+        (Wo): Linear(in_features=384, out_features=384, bias=False)
+      )
+      (mlp): MLP(
+        (Wup): Linear(in_features=384, out_features=768, bias=False)
+        (Wgate): Linear(in_features=384, out_features=768, bias=False)
+        (Wdown): Linear(in_features=768, out_features=384, bias=False)
+        (s_u): Scale()
+        (s_v): Scale()
+      )
+      (alpha_A): Scale()
+      (alpha_M): Scale()
+    )
+  )
+  (lm_head): Linear(in_features=384, out_features=50304, bias=True)
+  (s_z): Scale()
+)
+Initial GPU memory: 178 MB
+After warmup GPU memory: 178 MB
+Validating on 262144 tokens (16 steps with 16384 batch size)
+Total tokens across 1 shard(s): 100,000,000
+Tokens needed for 200 iterations: 3,276,800
+Training will use approximately 0.03 epochs over the data
+step:0/200 val_loss:83.1100 train_time:0ms step_avg:0.11ms
+Total tokens across 1 shard(s): 100,000,000
+Tokens needed for 200 iterations: 3,276,800
+Training will use approximately 0.03 epochs over the data
+step:1/200 train_time:390ms step_avg:389.63ms
+step:2/200 train_time:395ms step_avg:197.66ms
+step:3/200 train_time:400ms step_avg:133.40ms
+step:4/200 train_time:405ms step_avg:101.21ms
+step:5/200 train_time:409ms step_avg:81.89ms
+step:6/200 train_time:414ms step_avg:69.00ms
+step:7/200 train_time:418ms step_avg:59.78ms
+step:8/200 train_time:423ms step_avg:52.87ms
+step:9/200 train_time:691ms step_avg:76.74ms
+step:10/200 train_time:1000ms step_avg:100.05ms
+step:11/200 train_time:1376ms step_avg:125.09ms
+step:12/200 train_time:1671ms step_avg:139.23ms
+step:13/200 train_time:1964ms step_avg:151.09ms
+step:14/200 train_time:2261ms step_avg:161.51ms
+step:15/200 train_time:2554ms step_avg:170.27ms
+step:16/200 train_time:2930ms step_avg:183.12ms
+step:17/200 train_time:3306ms step_avg:194.48ms
+step:18/200 train_time:3689ms step_avg:204.94ms
+step:19/200 train_time:4060ms step_avg:213.68ms
+step:20/200 train_time:4365ms step_avg:218.25ms
+step:21/200 train_time:4663ms step_avg:222.03ms
+step:22/200 train_time:4977ms step_avg:226.22ms
+step:23/200 train_time:5269ms step_avg:229.10ms
+step:24/200 train_time:5559ms step_avg:231.63ms
+step:25/200 train_time:5885ms step_avg:235.41ms
+step:26/200 train_time:6171ms step_avg:237.35ms
+step:27/200 train_time:6470ms step_avg:239.62ms
+step:28/200 train_time:6795ms step_avg:242.67ms
+step:29/200 train_time:7096ms step_avg:244.69ms
+step:30/200 train_time:7408ms step_avg:246.94ms
+step:31/200 train_time:7700ms step_avg:248.40ms
+step:32/200 train_time:8003ms step_avg:250.09ms
+step:33/200 train_time:8302ms step_avg:251.58ms
+step:34/200 train_time:8616ms step_avg:253.41ms
+step:35/200 train_time:8908ms step_avg:254.52ms
+step:36/200 train_time:9208ms step_avg:255.77ms
+step:37/200 train_time:9511ms step_avg:257.05ms
+step:38/200 train_time:9822ms step_avg:258.48ms
+step:39/200 train_time:10115ms step_avg:259.36ms
+step:40/200 train_time:10410ms step_avg:260.24ms
+step:41/200 train_time:10727ms step_avg:261.64ms
+step:42/200 train_time:11076ms step_avg:263.72ms
+step:43/200 train_time:11370ms step_avg:264.41ms
+step:44/200 train_time:11719ms step_avg:266.34ms
+step:45/200 train_time:12046ms step_avg:267.69ms
+step:46/200 train_time:12336ms step_avg:268.18ms
+step:47/200 train_time:12639ms step_avg:268.91ms
+step:48/200 train_time:12977ms step_avg:270.36ms
+step:49/200 train_time:13277ms step_avg:270.95ms
+step:50/200 train_time:13608ms step_avg:272.16ms
+step:51/200 train_time:13904ms step_avg:272.62ms
+step:52/200 train_time:14233ms step_avg:273.71ms
+step:53/200 train_time:14528ms step_avg:274.12ms
+step:54/200 train_time:14829ms step_avg:274.61ms
+step:55/200 train_time:15159ms step_avg:275.61ms
+step:56/200 train_time:15452ms step_avg:275.93ms
+step:57/200 train_time:15828ms step_avg:277.68ms
+step:58/200 train_time:16209ms step_avg:279.46ms
+step:59/200 train_time:16515ms step_avg:279.92ms
+step:60/200 train_time:16871ms step_avg:281.19ms
+step:61/200 train_time:17177ms step_avg:281.59ms
+step:62/200 train_time:17469ms step_avg:281.75ms
+step:63/200 train_time:17833ms step_avg:283.06ms
+step:64/200 train_time:18208ms step_avg:284.51ms
+step:65/200 train_time:18590ms step_avg:286.00ms
+step:66/200 train_time:18895ms step_avg:286.28ms
+step:67/200 train_time:19246ms step_avg:287.26ms
+step:68/200 train_time:19543ms step_avg:287.40ms
+step:69/200 train_time:19898ms step_avg:288.37ms
+step:70/200 train_time:20192ms step_avg:288.46ms
+step:71/200 train_time:20487ms step_avg:288.54ms
+step:72/200 train_time:20778ms step_avg:288.58ms
+step:73/200 train_time:21064ms step_avg:288.55ms
+step:74/200 train_time:21398ms step_avg:289.16ms
+step:75/200 train_time:21692ms step_avg:289.23ms
+step:76/200 train_time:21992ms step_avg:289.36ms
+step:77/200 train_time:22357ms step_avg:290.34ms
+step:78/200 train_time:22652ms step_avg:290.41ms
+step:79/200 train_time:22970ms step_avg:290.76ms
+step:80/200 train_time:23293ms step_avg:291.16ms
+step:81/200 train_time:23628ms step_avg:291.70ms
+step:82/200 train_time:23939ms step_avg:291.94ms
+step:83/200 train_time:24323ms step_avg:293.05ms
+step:84/200 train_time:24660ms step_avg:293.57ms
+step:85/200 train_time:24983ms step_avg:293.92ms
+step:86/200 train_time:25312ms step_avg:294.33ms
+step:87/200 train_time:25621ms step_avg:294.50ms
+step:88/200 train_time:25923ms step_avg:294.58ms
+step:89/200 train_time:26230ms step_avg:294.72ms
+step:90/200 train_time:26542ms step_avg:294.91ms
+step:91/200 train_time:26876ms step_avg:295.34ms
+step:92/200 train_time:27231ms step_avg:295.98ms
+step:93/200 train_time:27530ms step_avg:296.02ms
+step:94/200 train_time:27821ms step_avg:295.97ms
+step:95/200 train_time:28114ms step_avg:295.94ms
+step:96/200 train_time:28489ms step_avg:296.76ms
+step:97/200 train_time:28788ms step_avg:296.78ms
+step:98/200 train_time:29100ms step_avg:296.94ms
+step:99/200 train_time:29404ms step_avg:297.01ms
+step:100/200 train_time:29693ms step_avg:296.93ms
+Validating on 262144 tokens (16 steps with 16384 batch size)
+Total tokens across 1 shard(s): 100,000,000
+Tokens needed for 200 iterations: 3,276,800
+Training will use approximately 0.03 epochs over the data
+step:100/200 val_loss:9.0857 train_time:31941ms step_avg:319.41ms
+step:101/200 train_time:31946ms step_avg:316.30ms
+step:102/200 train_time:31951ms step_avg:313.25ms
+step:103/200 train_time:31956ms step_avg:310.25ms
+step:104/200 train_time:31960ms step_avg:307.31ms
+step:105/200 train_time:31965ms step_avg:304.43ms
+step:106/200 train_time:31969ms step_avg:301.60ms
+step:107/200 train_time:31974ms step_avg:298.82ms
+step:108/200 train_time:32314ms step_avg:299.21ms
+step:109/200 train_time:32649ms step_avg:299.53ms
+step:110/200 train_time:33028ms step_avg:300.25ms
+step:111/200 train_time:33415ms step_avg:301.04ms
+step:112/200 train_time:33718ms step_avg:301.05ms
+step:113/200 train_time:34039ms step_avg:301.23ms
+step:114/200 train_time:34383ms step_avg:301.60ms
+step:115/200 train_time:34682ms step_avg:301.59ms
+step:116/200 train_time:34974ms step_avg:301.50ms
+step:117/200 train_time:35354ms step_avg:302.17ms
+step:118/200 train_time:35740ms step_avg:302.88ms
+step:119/200 train_time:36118ms step_avg:303.51ms
+step:120/200 train_time:36426ms step_avg:303.55ms
+step:121/200 train_time:36745ms step_avg:303.68ms
+step:122/200 train_time:37124ms step_avg:304.29ms
+step:123/200 train_time:37431ms step_avg:304.32ms
+step:124/200 train_time:37734ms step_avg:304.30ms
+step:125/200 train_time:38023ms step_avg:304.18ms
+step:126/200 train_time:38329ms step_avg:304.20ms
+step:127/200 train_time:38621ms step_avg:304.10ms
+step:128/200 train_time:38933ms step_avg:304.16ms
+step:129/200 train_time:39257ms step_avg:304.32ms
+step:130/200 train_time:39645ms step_avg:304.96ms
+step:131/200 train_time:39971ms step_avg:305.13ms
+step:132/200 train_time:40272ms step_avg:305.09ms
+step:133/200 train_time:40590ms step_avg:305.19ms
+step:134/200 train_time:40945ms step_avg:305.56ms
+step:135/200 train_time:41241ms step_avg:305.49ms
+step:136/200 train_time:41538ms step_avg:305.43ms
+step:137/200 train_time:41834ms step_avg:305.36ms
+step:138/200 train_time:42156ms step_avg:305.48ms
+step:139/200 train_time:42448ms step_avg:305.38ms
+step:140/200 train_time:42776ms step_avg:305.54ms
+step:141/200 train_time:43077ms step_avg:305.51ms
+step:142/200 train_time:43377ms step_avg:305.47ms
+step:143/200 train_time:43679ms step_avg:305.45ms
+step:144/200 train_time:44066ms step_avg:306.01ms
+step:145/200 train_time:44368ms step_avg:305.98ms
+step:146/200 train_time:44747ms step_avg:306.48ms
+step:147/200 train_time:45068ms step_avg:306.58ms
+step:148/200 train_time:45364ms step_avg:306.51ms
+step:149/200 train_time:45749ms step_avg:307.04ms
+step:150/200 train_time:46053ms step_avg:307.02ms
+step:151/200 train_time:46362ms step_avg:307.03ms
+step:152/200 train_time:46658ms step_avg:306.96ms
+step:153/200 train_time:46974ms step_avg:307.02ms
+step:154/200 train_time:47283ms step_avg:307.03ms
+step:155/200 train_time:47593ms step_avg:307.05ms
+step:156/200 train_time:47889ms step_avg:306.98ms
+step:157/200 train_time:48190ms step_avg:306.94ms
+step:158/200 train_time:48505ms step_avg:306.99ms
+step:159/200 train_time:48819ms step_avg:307.04ms
+step:160/200 train_time:49206ms step_avg:307.54ms
+step:161/200 train_time:49518ms step_avg:307.57ms
+step:162/200 train_time:49891ms step_avg:307.97ms
+step:163/200 train_time:50192ms step_avg:307.93ms
+step:164/200 train_time:50489ms step_avg:307.86ms
+step:165/200 train_time:50796ms step_avg:307.85ms
+step:166/200 train_time:51159ms step_avg:308.18ms
+step:167/200 train_time:51451ms step_avg:308.09ms
+step:168/200 train_time:51761ms step_avg:308.10ms
+step:169/200 train_time:52054ms step_avg:308.01ms
+step:170/200 train_time:52351ms step_avg:307.95ms
+step:171/200 train_time:52673ms step_avg:308.03ms
+step:172/200 train_time:53009ms step_avg:308.19ms
+step:173/200 train_time:53314ms step_avg:308.17ms
+step:174/200 train_time:53616ms step_avg:308.14ms
+step:175/200 train_time:53961ms step_avg:308.35ms
+step:176/200 train_time:54263ms step_avg:308.31ms
+step:177/200 train_time:54584ms step_avg:308.38ms
+step:178/200 train_time:54885ms step_avg:308.34ms
+step:179/200 train_time:55180ms step_avg:308.27ms
+step:180/200 train_time:55480ms step_avg:308.22ms
+step:181/200 train_time:55860ms step_avg:308.62ms
+step:182/200 train_time:56192ms step_avg:308.75ms
+step:183/200 train_time:56490ms step_avg:308.69ms
+step:184/200 train_time:56784ms step_avg:308.61ms
+step:185/200 train_time:57081ms step_avg:308.54ms
+step:186/200 train_time:57385ms step_avg:308.52ms
+step:187/200 train_time:57681ms step_avg:308.45ms
+step:188/200 train_time:57997ms step_avg:308.50ms
+step:189/200 train_time:58310ms step_avg:308.52ms
+step:190/200 train_time:58612ms step_avg:308.48ms
+step:191/200 train_time:58916ms step_avg:308.46ms
+step:192/200 train_time:59296ms step_avg:308.83ms
+step:193/200 train_time:59607ms step_avg:308.84ms
+step:194/200 train_time:59959ms step_avg:309.07ms
+step:195/200 train_time:60269ms step_avg:309.07ms
+step:196/200 train_time:60561ms step_avg:308.98ms
+step:197/200 train_time:60877ms step_avg:309.02ms
+step:198/200 train_time:61223ms step_avg:309.21ms
+step:199/200 train_time:61602ms step_avg:309.56ms
+step:200/200 train_time:61903ms step_avg:309.52ms
+Validating on 262144 tokens (16 steps with 16384 batch size)
+Total tokens across 1 shard(s): 100,000,000
+Tokens needed for 200 iterations: 3,276,800
+Training will use approximately 0.03 epochs over the data
+step:200/200 val_loss:8.6183 train_time:64417ms step_avg:322.08ms
+peak memory allocated: 6488 MiB reserved: 6710 MiB
+---------- making sure assertions worked ----------
+tensor([0.1142, 0.0728, 0.1018, 0.0806, 0.0884], device='cuda:0')
+tensor([1.0000, 1.0000, 1.0000, 1.0000, 1.0000], device='cuda:0',
+       grad_fn=<SliceBackward0>)
+tensor([1., 1., 1., 1., 1.], device='cuda:0', grad_fn=<SliceBackward0>)
+Once upon a time, use have known early most no need one and different than much important by from most
+The meaning of life is or last then where need but or for see time can high children people of very
+In the year 2026, than must same one early the for your now be, is few? we what
+I'm a Large Language Model (LLM), which means In its time from some this being had different for this very so very also up
+Found HellaSwag dataset at ./data/hellaswag/hellaswag_val.jsonl, running evaluation...
+Starting HellaSwag evaluation...
+---
+Context:
+ A man is sitting on a roof. he
+Endings:
+0 (loss: 8.6929) is using wrap to wrap a pair of skis.
+1 (loss: 9.1579) is ripping level tiles off.
+2 (loss: 8.7596) is holding a rubik's cube.
+3 (loss: 8.6730) starts pulling up roofing on a roof.
+predicted: 3, actual: 3
+---
+Context:
+ A lady walks to a barbell. She bends down and grabs the pole. the lady
+Endings:
+0 (loss: 8.6369) swings and lands in her arms.
+1 (loss: 9.4851) pulls the barbell forward.
+2 (loss: 9.0903) pulls a rope attached to the barbell.
+3 (loss: 8.6095) stands and lifts the weight over her head.
+predicted: 3, actual: 3
+---
+Context:
+ Two women in a child are shown in a canoe while a man pulls the canoe while standing in the water, with other individuals visible in the background. the child and a different man
+Endings:
+0 (loss: 8.4527) are then shown paddling down a river in a boat while a woman talks.
+1 (loss: 8.3377) are driving the canoe, they go down the river flowing side to side.
+2 (loss: 8.7667) sit in a canoe while the man paddles.
+3 (loss: 8.5906) walking go down the rapids, while the man in his helicopter almost falls and goes out of canoehood.
+predicted: 1, actual: 2
+---
+Context:
+ A boy is running down a track. the boy
+Endings:
+0 (loss: 8.0419) runs into a car.
+1 (loss: 8.2098) gets in a mat.
+2 (loss: 8.4897) lifts his body above the height of a pole.
+3 (loss: 8.3623) stands on his hands and springs.
+predicted: 0, actual: 2
+---
+Context:
+ The boy lifts his body above the height of a pole. The boy lands on his back on to a red mat. the boy
+Endings:
+0 (loss: 8.2153) turns his body around on the mat.
+1 (loss: 8.1261) gets up from the mat.
+2 (loss: 8.3920) continues to lift his body over the pole.
+3 (loss: 8.7493) wiggles out of the mat.
+predicted: 1, actual: 1
+HellaSwag evaluation complete - 20 examples
+Accuracy: 5/20=0.2500 [95% CI: 0.1119-0.4687]
+Normalized accuracy: 4/20=0.2000 [95% CI: 0.0807-0.4160]

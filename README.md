@@ -8,3 +8,7 @@ torchrun --nproc_per_node=2 train_ngpt.py
 ```
 torchrun --nproc_per_node=2 train_ngpt_triton.py
 ```
+
+```
+torchrun --nproc_per_node=2 train_MoScale.py
+```
