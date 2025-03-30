@@ -8,7 +8,7 @@ from torch.library import triton_op, wrap_triton
 
 # lets us cache a ton of different kernels when benchmarking
 import torch._dynamo
-torch._dynamo.config.cache_size_limit = 64  # Increase from default of 8
+torch._dynamo.config.cache_size_limit = 256  # Increase from default of 8
 
 # fixes issue w frankenstein custom ops not keeping autograd graph during benchmark
 torch._functorch.config.donated_buffer=False
@@ -37,8 +37,9 @@ def scaled_logits_naive_bwd(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor, d
     return dLdA, dLdB, dLds
 
 
-# for saving the fwd pass' autotuned BLOCK_SIZE_M for use later in the bwd pass
+# for saving the fwd pass' autotuned block sizes for use later in the bwd pass
 _block_size_m = None
+_block_size_n = None
 
 autotune_configs = [
     triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
@@ -116,13 +117,12 @@ autotune_configs = [
 def scaled_logits_dLdA(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
-    s_ptr, dLds_parts_ptr, dLds_ptr,
+    s_ptr,
     M, N, K, 
     stride_a_M, stride_a_K, 
     stride_b_K, stride_b_N, 
     stride_d_M, stride_d_N, 
     stride_s_N,
-    stride_dLds_parts_LG, stride_dLds_parts_N,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, #LOCK_GROUP_SIZE: tl.constexpr,
 ):
@@ -177,13 +177,12 @@ autotune_configs = [
 def scaled_logits_dLdB(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
-    s_ptr, dLds_parts_ptr, dLds_ptr,
+    s_ptr,
     M, N, K, 
     stride_a_M, stride_a_K, 
     stride_b_K, stride_b_N, 
     stride_d_M, stride_d_N, 
     stride_s_N,
-    stride_dLds_parts_LG, stride_dLds_parts_N,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, #LOCK_GROUP_SIZE: tl.constexpr,
 ):
@@ -222,29 +221,27 @@ def scaled_logits_dLdB(
     b_mask = (offsets_K[:, None] < K) & (offsets_N[None, :] < N) 
     tl.store(dLdb_ptr + b_offsets, dLdb.to(dLdb_ptr.type.element_ty), mask=b_mask) # shape (BLOCK_SIZE_K, BLOCK_SIZE_N)
 
-autotune_configs = [
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64, 'GROUP_SIZE': 8}, num_stages=3, num_warps=8),
-    triton.Config({'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=4, num_warps=4),
-    triton.Config({'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2),
-    triton.Config({'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32, 'GROUP_SIZE': 8}, num_stages=5, num_warps=2)
-]
-@triton.autotune(configs = autotune_configs, key=['M', 'N', 'K'])
+
+@triton.autotune([
+        triton.Config(
+            {"BLOCK_SIZE_K": BLOCK_SIZE_K, "GROUP_SIZE": 8},
+            num_stages=ns, num_warps=nw)
+        for BLOCK_SIZE_K in [16, 32, 64]
+        for ns in [2, 3, 4, 5]
+        for nw in [2, 4, 8, 16]],
+    key=["K"],)
 @triton.jit
 def scaled_logits_dLds_p1(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
-    s_ptr, dLds_parts_ptr, dLds_ptr,
+    s_ptr, dLds_parts_ptr, dLds_ptr, debug_ptr, debug2_ptr,
     M, N, K, 
     stride_a_M, stride_a_K, 
     stride_b_K, stride_b_N, 
     stride_d_M, stride_d_N, 
     stride_s_N,
-    stride_dLds_parts_ROW, stride_dLds_parts_N,
-    locks_ptr, lock_group_ct, lock_group_size,
+    stride_dLds_parts_M, stride_dLds_parts_N,
+    locks_ptr, num_locks_M, stride_locks_M, stride_locks_N,
     BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
     GROUP_SIZE: tl.constexpr, #LOCK_GROUP_SIZE: tl.constexpr,
 ):
@@ -281,35 +278,56 @@ def scaled_logits_dLds_p1(
     d_offsets = stride_d_M * offsets_M[:, None] + stride_d_N * offsets_N[None, :]
     d_mask = (offsets_M[:, None] < M) & (offsets_N[None, :] < N) 
     dLdd = tl.load(dLdd_ptr + d_offsets, mask=d_mask, other=0.).to(tl.float32)
-    dLds_part = tl.sum(dLdd * c, axis=0) # (BLOCK_SIZE_N)
+    dLds_part = tl.sum(dLdd * c, axis=0).to(tl.float32) # (BLOCK_SIZE_N)
 
-    
-    # store it
-    dLds_parts_ptr += PID_M * stride_dLds_parts_ROW
+    """
+    # naive implementation with no locks; equivalent to lock_group_size = 1
+    dLds_parts_ptr += PID_M * stride_dLds_parts_M
     tl.store(
         dLds_parts_ptr + offsets_N * stride_dLds_parts_N, 
         dLds_part.to(dLds_parts_ptr.type.element_ty), 
         mask=mask_N
     )
-
     """
     # add contribution to lock group
-    lock_id = PID_M // lock_group_size
-    locks_ptr += lock_id
-    count_ptr = locks_ptr + lock_group_ct
-    dLds_parts_ptr += lock_id * stride_dLds_parts_ROW
+    lock_id_M = PID_M  % num_locks_M
+    lock_id_N = PID_N
+    locks_ptr += lock_id_M * stride_locks_M + lock_id_N * stride_locks_N
+    count_ptr = locks_ptr + num_locks_M * stride_locks_M
+    dLds_parts_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
+    debug_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
+    debug2_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
+    offsets_N = tl.arange(0, BLOCK_SIZE_N) * stride_dLds_parts_N
+    # check lock
     while tl.atomic_cas(locks_ptr, 0, 1) == 1:
         pass
-    count = tl.load(count_ptr) # shape (1)
-    if count == 0: # if this PID is the first one to access the lock
+    # Check if we're the first thread for this lock
+    count = tl.load(count_ptr)
+    if count == 0: # if so, then set count to 1 so future threads know they're not
         tl.atomic_xchg(count_ptr, 1)
-    else: # but if this is not the first pid in the accumulation process then we've actually gotta accumulate
-        dLds_part += tl.load(dLds_parts_ptr + offsets_N * stride_dLds_parts_N, mask=mask_N, other=0.)
-    # finally store our accumulated values back to DRAM and release the lock
-    tl.store(dLds_parts_ptr + offsets_N * stride_dLds_parts_N, 
-            dLds_part, 
+    else:
+        # Subsequent threads add to existing value
+        #dLds_part += tl.load(dLds_parts_ptr + offsets_N, mask=mask_N).to(tl.float32)
+        #current_values = tl.load(dLds_parts_ptr + offsets_N, mask=mask_N, other=0.).to(tl.float32)
+        #tl.store(dLds_parts_ptr + offsets_N, 
+                #(current_values + dLds_part).to(dLds_parts_ptr.type.element_ty), 
+                #mask=mask_N)
+        # Atomic add is safer for accumulation
+        #tl.atomic_add(dLds_parts_ptr + offsets_N, dLds_part.to(dLds_parts_ptr.type.element_ty), mask=mask_N)
+        # Fix: Avoid in-place addition which may cause numerical issues
+        current_values = tl.load(dLds_parts_ptr + offsets_N, mask=mask_N, other=0.0).to(tl.float32)
+        tl.store(debug_ptr + offsets_N, 
+                current_values.to(debug_ptr.type.element_ty), 
+                mask=mask_N)
+        tl.store(debug2_ptr + offsets_N, 
+                (dLds_part + current_values).to(debug_ptr.type.element_ty), 
+                mask=mask_N)
+    tl.store(dLds_parts_ptr + offsets_N, 
+            dLds_part.to(dLds_parts_ptr.type.element_ty), 
             mask=mask_N)
-    tl.atomic_xchg(locks_ptr, 0)"""
+    # Release lock
+    tl.atomic_xchg(locks_ptr, 0)
+    #"""
 
 @triton.autotune([
         triton.Config(
@@ -326,18 +344,19 @@ def scaled_logits_dLds_p2(
     BLOCK_SIZE_ROWS: tl.constexpr, BLOCK_SIZE_COLS: tl.constexpr
 ):
     pid = tl.program_id(0)
+    dLds_parts_ptr += pid * BLOCK_SIZE_COLS 
+    dLds_ptr += pid * BLOCK_SIZE_COLS 
     offsets_ROW = tl.arange(0, BLOCK_SIZE_ROWS)
-    offsets_COL = pid * BLOCK_SIZE_COLS + tl.arange(0, BLOCK_SIZE_COLS)
-    mask_COL = offsets_COL < COLS
-    dLds_offsets = offsets_ROW[:, None] * stride_dLds_parts_ROW + offsets_COL[None, :] * stride_dLds_parts_COL
+    offsets_COL = tl.arange(0, BLOCK_SIZE_COLS)
+    mask_COL = pid * BLOCK_SIZE_COLS + offsets_COL < COLS
 
     dLds = tl.zeros([BLOCK_SIZE_COLS], dtype=tl.float32)
     for _ in range(0, ROWS, BLOCK_SIZE_ROWS):
+        dLds_parts_offsets = offsets_ROW[:, None] * stride_dLds_parts_ROW + offsets_COL[None, :] * stride_dLds_parts_COL
         mask = (offsets_ROW[:, None] < ROWS) & mask_COL[None, :]
-        dLds_part = tl.load(dLds_parts_ptr + dLds_offsets, mask=mask, other=0.).to(tl.float32) #(BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS)
+        dLds_part = tl.load(dLds_parts_ptr + dLds_parts_offsets, mask=mask, other=0.).to(tl.float32) #(BLOCK_SIZE_ROWS, BLOCK_SIZE_COLS)
         dLds += tl.sum(dLds_part, axis=0) # (BLOCK_SIZE_COLS)
         offsets_ROW += BLOCK_SIZE_ROWS
-        dLds_offsets += BLOCK_SIZE_ROWS
 
     tl.store(dLds_ptr + offsets_COL * stride_dLds_COL, dLds.to(dLds_ptr.type.element_ty), mask=mask_COL)
 
@@ -348,6 +367,7 @@ def scaled_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> t
     C * s = D
     """
     global _block_size_m
+    global _block_size_n
     assert A.shape[-1] == B.shape[-2]
     assert s.shape[0] == B.shape[-1]
     assert s.ndim == 1
@@ -363,21 +383,15 @@ def scaled_logits_triton(A: torch.Tensor, B: torch.Tensor, s: torch.Tensor) -> t
         s.stride(0)
     )
     # Save config for backward pass
-    best_config = getattr(scaled_logits_fwd, "best_config", None)
-    _block_size_m = best_config.kwargs['BLOCK_SIZE_M']
+    _block_size_m = getattr(scaled_logits_fwd, "best_config", None).kwargs['BLOCK_SIZE_M']
+    _block_size_n = getattr(scaled_logits_fwd, "best_config", None).kwargs['BLOCK_SIZE_N']
     return D
 
 def scaled_logits_triton_bwd(ctx, dLdD):
     global _block_size_m
+    global _block_size_n
     A, B, s, D = ctx.saved_tensors
     M, N, K = ctx.M, ctx.N, ctx.K
-
-    # Use config from forward pass
-    num_pids_M = triton.cdiv(M, _block_size_m)
-    lock_group_size = 1 # TODO set heuristically
-    lock_group_ct = triton.cdiv(num_pids_M, lock_group_size)
-    dLds_parts = torch.empty((lock_group_ct, N), dtype=torch.float32, device=A.device)
-    locks = torch.zeros(2 * lock_group_ct, dtype=torch.int32, device=A.device)
 
     dLdA = torch.empty_like(A)
     dLdB = torch.empty_like(B)
@@ -387,49 +401,62 @@ def scaled_logits_triton_bwd(ctx, dLdD):
     wrap_triton(scaled_logits_dLdA)[grid_dLdA](
         A, B, D, 
         dLdA, dLdB, dLdD, 
-        s, dLds_parts, dLds,
+        s, 
         M, N, K, 
         A.stride(0), A.stride(1), 
         B.stride(0), B.stride(1), 
         D.stride(0), D.stride(1), 
         s.stride(0),
-        dLds_parts.stride(0), dLds_parts.stride(1)
     )
 
     grid_dLdB = lambda meta: (triton.cdiv(K, meta['BLOCK_SIZE_K']) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
     wrap_triton(scaled_logits_dLdB)[grid_dLdB](
         A, B, D, 
         dLdA, dLdB, dLdD, 
-        s, dLds_parts, dLds,
+        s, 
         M, N, K,
         A.stride(0), A.stride(1), 
         B.stride(0), B.stride(1), 
         D.stride(0), D.stride(1), 
         s.stride(0),
-        dLds_parts.stride(0), dLds_parts.stride(1)
     )
+
+    # Use config from forward pass
+    num_pids_M = triton.cdiv(M, _block_size_m)
+    num_pids_N = triton.cdiv(N, _block_size_n)
+    lock_group_size = 1 # TODO set heuristically
+    num_locks_M = triton.cdiv(num_pids_M, lock_group_size)
+    print(num_pids_M, num_pids_N, num_locks_M)
+    dLds_parts = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
+    locks = torch.zeros((2 * num_locks_M, num_pids_N), dtype=torch.int32, device=A.device)
     
-    grid_dLds_p1 = lambda meta: (triton.cdiv(M, _block_size_m) * triton.cdiv(N, meta['BLOCK_SIZE_N']),)
+    debug = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
+    debug2 = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
+
+    grid_dLds_p1 = lambda meta: (num_pids_M * num_pids_N,)
     wrap_triton(scaled_logits_dLds_p1)[grid_dLds_p1](
         A, B, D, 
         dLdA, dLdB, dLdD, 
-        s, dLds_parts, dLds,
+        s, dLds_parts, dLds, debug, debug2,
         M, N, K,
         A.stride(0), A.stride(1), 
         B.stride(0), B.stride(1), 
         D.stride(0), D.stride(1), 
         s.stride(0),
         dLds_parts.stride(0), dLds_parts.stride(1),
-        locks, lock_group_ct, lock_group_size,
-        BLOCK_SIZE_M = _block_size_m
+        locks, num_locks_M, locks.stride(0), locks.stride(1),
+        BLOCK_SIZE_M = _block_size_m, BLOCK_SIZE_N = _block_size_n
     )
     print(dLds_parts)
+    print(debug)
+    print(debug2)
+    print(dLds_parts.sum(0))
     grid_dLds_p2 = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_COLS']),)
     wrap_triton(scaled_logits_dLds_p2)[grid_dLds_p2](
         dLds_parts, dLds,
         dLds_parts.stride(0), dLds_parts.stride(1),
         dLds.stride(0),
-        ROWS=lock_group_ct, COLS=N,
+        ROWS=num_locks_M, COLS=N,
     )
 
     return dLdA, dLdB, dLds
@@ -703,16 +730,41 @@ if __name__ == "__main__":
                 print(f"dtype={dtype} | M,N,K={size} | Peak memory used by PyTorch operator: {pytorch_peak * 1e-6:.1f} Mb")
                 print(f"Memory saved: {100 * (pytorch_peak - custom_peak) / pytorch_peak:.2f}%")
     else:
-        #test(2, 2, 2, torch.float32)
-        #test(2, 2, 2, torch.float16)
+        
+        # (prolly) no masking
         test(32, 32, 32, torch.float32)
         test(32, 32, 32, torch.float16)
         test(128, 128, 128, torch.float32)
         test(128, 128, 128, torch.float16)
         test(512, 512, 512, torch.float32)
         test(512, 512, 512, torch.float16)
+        test(1024, 1024, 1024, torch.float32)
+        test(1024, 1024, 1024, torch.float16)
+        test(2048, 2048, 2048, torch.float32)
+        test(2048, 2048, 2048, torch.float16)
+
+        # masking
+        test(2, 2, 2, torch.float32)
+        test(2, 2, 2, torch.float16)
+        test(39, 39, 39, torch.float32)
+        test(39, 39, 39, torch.float16)
+        test(2067, 2067, 2067, torch.float32)
+        test(2067, 2067, 2067, torch.float16)
+        
+        # uneven dimensions
+        test(1024, 256, 128, torch.float32)
+        test(1024, 256, 128, torch.float16)
+        test(32, 512, 2024, torch.float32)
+        test(32, 512, 2024, torch.float16)
         test(8*1024, 2**14, 384, torch.float32) 
         test(8*1024, 2**14, 384, torch.float16)
-
-
     
+        
+        # uneven dimensions & masking
+        test(1080, 267, 129, torch.float32)
+        test(1080, 267, 129, torch.float16)
+        test(31, 569, 2199, torch.float32)
+        test(31, 569, 2199, torch.float16)
+        test(8*1024+3, 2**14+42, 383, torch.float16)
+        test(8*1024+3, 2**14+42, 383, torch.float32) 
+
