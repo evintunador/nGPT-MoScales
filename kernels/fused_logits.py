@@ -227,14 +227,14 @@ def scaled_logits_dLdB(
             {"BLOCK_SIZE_K": BLOCK_SIZE_K, "GROUP_SIZE": 8},
             num_stages=ns, num_warps=nw)
         for BLOCK_SIZE_K in [16, 32, 64]
-        for ns in [2, 3, 4, 5]
+        for ns in [2,3,5,7]
         for nw in [2, 4, 8, 16]],
     key=["K"],)
 @triton.jit
 def scaled_logits_dLds_p1(
     a_ptr, b_ptr, d_ptr, 
     dLda_ptr, dLdb_ptr, dLdd_ptr, 
-    s_ptr, dLds_parts_ptr, dLds_ptr, debug_ptr, debug2_ptr,
+    s_ptr, dLds_parts_ptr, dLds_ptr, debug_ptr, debug2_ptr, debuglocks_ptr,
     M, N, K, 
     stride_a_M, stride_a_K, 
     stride_b_K, stride_b_N, 
@@ -295,9 +295,16 @@ def scaled_logits_dLds_p1(
     locks_ptr += lock_id_M * stride_locks_M + lock_id_N * stride_locks_N
     count_ptr = locks_ptr + num_locks_M * stride_locks_M
     dLds_parts_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
+    offsets_N = tl.arange(0, BLOCK_SIZE_N) * stride_dLds_parts_N
+
+    # extra for debugging
+    debuglocks_ptr += lock_id_M * stride_locks_M + lock_id_N * stride_locks_N
+    debugcount_ptr = locks_ptr + num_locks_M * stride_locks_M
     debug_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
     debug2_ptr += lock_id_M * stride_dLds_parts_M + lock_id_N * BLOCK_SIZE_N * stride_dLds_parts_N
-    offsets_N = tl.arange(0, BLOCK_SIZE_N) * stride_dLds_parts_N
+
+
+    """
     # check lock
     while tl.atomic_cas(locks_ptr, 0, 1) == 1:
         pass
@@ -305,16 +312,14 @@ def scaled_logits_dLds_p1(
     count = tl.load(count_ptr)
     if count == 0: # if so, then set count to 1 so future threads know they're not
         tl.atomic_xchg(count_ptr, 1)
-    else:
-        # Subsequent threads add to existing value
+    else: # otherwise, this PID is not first and therefore needs to accumulate
+        ### the code we want to run
         #dLds_part += tl.load(dLds_parts_ptr + offsets_N, mask=mask_N).to(tl.float32)
-        #current_values = tl.load(dLds_parts_ptr + offsets_N, mask=mask_N, other=0.).to(tl.float32)
-        #tl.store(dLds_parts_ptr + offsets_N, 
-                #(current_values + dLds_part).to(dLds_parts_ptr.type.element_ty), 
-                #mask=mask_N)
-        # Atomic add is safer for accumulation
-        #tl.atomic_add(dLds_parts_ptr + offsets_N, dLds_part.to(dLds_parts_ptr.type.element_ty), mask=mask_N)
-        # Fix: Avoid in-place addition which may cause numerical issues
+
+        ### the debugging code that shouldn't even trigger given that we only have one PID
+        # this first line does not trigger (debuglocks prints out as all zeros)
+        tl.atomic_xchg(debugcount_ptr, 1) 
+        # but then these lines do trigger (debug and debug2 tensors filled with values)
         current_values = tl.load(dLds_parts_ptr + offsets_N, mask=mask_N, other=0.0).to(tl.float32)
         tl.store(debug_ptr + offsets_N, 
                 current_values.to(debug_ptr.type.element_ty), 
@@ -322,12 +327,32 @@ def scaled_logits_dLds_p1(
         tl.store(debug2_ptr + offsets_N, 
                 (dLds_part + current_values).to(debug_ptr.type.element_ty), 
                 mask=mask_N)
+    """
+
+    # i brought some of the code out of the else statement to show that it's this current_values loading that's the issue
+    # although of note is the fact that this current_values loading was triggering even inside the else statement when the else statement wasn't getting triggered
+    tl.debug_barrier()
+    current_values = tl.load(dLds_parts_ptr + offsets_N, mask=mask_N).to(tl.float32)
+    tl.debug_barrier()
+    tl.store(debug_ptr + offsets_N, 
+            current_values.to(debug_ptr.type.element_ty), 
+            mask=mask_N)
+    tl.store(debug2_ptr + offsets_N, 
+            (dLds_part + current_values).to(debug2_ptr.type.element_ty), 
+            mask=mask_N)
+    # store output
+    #tl.atomic_xchg(dLds_parts_ptr + offsets_N, 0.) # clean up
+    tl.debug_barrier()
     tl.store(dLds_parts_ptr + offsets_N, 
             dLds_part.to(dLds_parts_ptr.type.element_ty), 
             mask=mask_N)
-    # Release lock
-    tl.atomic_xchg(locks_ptr, 0)
+    # finally release lock
+    #tl.atomic_xchg(locks_ptr, 0)
     #"""
+    # Use atomic add to avoid race conditions across threads within the block
+    #for i in range(BLOCK_SIZE_N):
+        #if i < N:
+            #tl.atomic_add(dLds_parts_ptr + i * stride_dLds_parts_N, dLds_part[i])
 
 @triton.autotune([
         triton.Config(
@@ -426,9 +451,11 @@ def scaled_logits_triton_bwd(ctx, dLdD):
     num_pids_N = triton.cdiv(N, _block_size_n)
     lock_group_size = 1 # TODO set heuristically
     num_locks_M = triton.cdiv(num_pids_M, lock_group_size)
-    print(num_pids_M, num_pids_N, num_locks_M)
+    print("num_pids_M, num_pids_N, num_locks_M:\n", num_pids_M, num_pids_N, num_locks_M)
     dLds_parts = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
     locks = torch.zeros((2 * num_locks_M, num_pids_N), dtype=torch.int32, device=A.device)
+    print("locks:\n", locks)
+    debuglocks = torch.zeros((2 * num_locks_M, num_pids_N), dtype=torch.int32, device=A.device)
     
     debug = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
     debug2 = torch.zeros((num_locks_M, N), dtype=torch.float32, device=A.device)
@@ -437,7 +464,7 @@ def scaled_logits_triton_bwd(ctx, dLdD):
     wrap_triton(scaled_logits_dLds_p1)[grid_dLds_p1](
         A, B, D, 
         dLdA, dLdB, dLdD, 
-        s, dLds_parts, dLds, debug, debug2,
+        s, dLds_parts, dLds, debug, debug2, debuglocks,
         M, N, K,
         A.stride(0), A.stride(1), 
         B.stride(0), B.stride(1), 
@@ -447,10 +474,12 @@ def scaled_logits_triton_bwd(ctx, dLdD):
         locks, num_locks_M, locks.stride(0), locks.stride(1),
         BLOCK_SIZE_M = _block_size_m, BLOCK_SIZE_N = _block_size_n
     )
-    print(dLds_parts)
-    print(debug)
-    print(debug2)
-    print(dLds_parts.sum(0))
+    print("dLds_parts:\n", dLds_parts)
+    print("debug:\n", debug)
+    print("debug2:\n", debug2)
+    print("locks:\n", locks)
+    print("debuglocks:\n", debuglocks)
+    print("dLds_parts.sum(0):\n", dLds_parts.sum(0))
     grid_dLds_p2 = lambda meta: (triton.cdiv(N, meta['BLOCK_SIZE_COLS']),)
     wrap_triton(scaled_logits_dLds_p2)[grid_dLds_p2](
         dLds_parts, dLds,
@@ -733,6 +762,7 @@ if __name__ == "__main__":
         
         # (prolly) no masking
         test(32, 32, 32, torch.float32)
+        """
         test(32, 32, 32, torch.float16)
         test(128, 128, 128, torch.float32)
         test(128, 128, 128, torch.float16)
@@ -767,4 +797,5 @@ if __name__ == "__main__":
         test(31, 569, 2199, torch.float16)
         test(8*1024+3, 2**14+42, 383, torch.float16)
         test(8*1024+3, 2**14+42, 383, torch.float32) 
+        #"""
 
