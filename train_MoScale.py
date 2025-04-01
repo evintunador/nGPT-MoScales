@@ -56,14 +56,25 @@ class Scale(nn.Module):
         return self.s * (self.init / self.scale) # shape (heads, dim)
 
 class MoScale(nn.Module):
-    def __init__(self, dim, rank):
+    def __init__(self, dim: int, rank: int, bias: bool = False):
         super().__init__()
         assert rank < dim
-        self.w = nn.Linear(dim, rank, bias=True)
+        self.init = 0.05
+        self.scale = 1. / math.sqrt(dim)
+        if bias:
+            self.s = nn.Parameter(torch.ones(dim, rank) * self.scale / rank / 2)
+            self.bias = nn.Parameter(torch.ones(rank) * self.scale / rank / 2)
+        else:
+            self.s = nn.Parameter(torch.ones(dim, rank) * self.scale / rank)
+            self.bias = None
 
     def forward(self, x): # (b, n, d)
-        probs = F.softmax(self.w(x), dim=-1) # (b, n, r) where r << d
-        scales = probs.unsqueeze(2) * self.w.weight.T.unsqueeze(0) # (b, n, 1, r) * (1, d, r) -> (b, n, d, r)
+        w = self.s * (self.init / self.scale)
+        if self.bias:
+            probs = F.softmax(x @ w + self.bias, dim=-1) # (b, n, r) where r << d
+        else:
+            probs = F.softmax(x @ w, dim=-1) # (b, n, r)
+        scales = probs.unsqueeze(2) * w.unsqueeze(0) # (b, n, 1, r) * (1, d, r) -> (b, n, d, r)
         scale = torch.sum(scales, dim=-1).squeeze(-1) # (b, n, d)
         return scale
 
@@ -157,7 +168,7 @@ class MLP(nn.Module):
         return self.Wdown(hidden) # (batch_size, seq_len, output_dim)
 
 class Block(nn.Module):
-    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, eigen_rank: int, layer_idx: int):
+    def __init__(self, dim: int, num_heads: int, mlp_ratio: int, max_seq_len: int, layer_idx: int, MoS_A: MoScale, MoS_M: MoScale):
         super().__init__()
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim, mlp_ratio)
@@ -167,16 +178,14 @@ class Block(nn.Module):
             # but now i can't find the reference to that in the paper
         # eigen learning rate vector
         #self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
-        self.alpha_A = MoScale(dim, eigen_rank)
-        self.alpha_M = MoScale(dim, eigen_rank)
+        self.alpha_A = MoS_A
+        self.alpha_M = MoS_M
 
     def forward(self, x: Tensor, block_mask: BlockMask):
         x_A = cosine_norm(self.attn(x, block_mask))
         x = cosine_norm(x + self.alpha_A(x) * (x_A - x))
-        #x = resid(x, self.attn(x, block_mask), self.alpha_A(x))
         x_M = cosine_norm(self.mlp(x))
         x = cosine_norm(x + self.alpha_M(x) * (x_M - x))
-        #x = resid(x, self.mlp(x), self.alpha_M(x))
         return x
 
 # -----------------------------------------------------------------------------
@@ -186,13 +195,17 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int, eigen_rank: int):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int, MoSBias: bool):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
         self.vocab_size = vocab_size
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.blocks = nn.ModuleList([Block(model_dim, num_heads, mlp_ratio, max_seq_len, eigen_rank, i) for i in range(num_layers)])
+        self.MoS_A = MoScale(model_dim, num_layers, bias=MoSBias)
+        self.MoS_M = MoScale(model_dim, num_layers, bias=MoSBias)
+        self.blocks = nn.ModuleList(
+            [Block(model_dim, num_heads, mlp_ratio, max_seq_len, i, self.MoS_A, self.MoS_M) 
+            for i in range(num_layers)])
         # there are only 50257 unique GPT-2 tokens; we extend to nearest multiple of 128 for efficiency. this originates from Karpathy's experiments.
         self.lm_head = nn.Linear(model_dim, next_multiple_of_n(vocab_size, n=128))
         # scaling param to un-limit the range for the final probability distribution (see page 2)
@@ -207,20 +220,16 @@ class GPT(nn.Module):
         """
         # whereas GPT-2 used std = 0.02, we'll do square root of model's embedding dimension
         std = math.sqrt(self.model_dim) 
-
         if isinstance(module, (nn.Linear, nn.Parameter)):
             # specific weight matrices at the end of each layer are given smaller std 
             # originally this was done in GPT-2 to keep the residual stream small
             if hasattr(module, 'GPT_scale_init'):
                 std *= (2 * len(self.blocks)) ** -0.5
-
             # carries out the actual initialization
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
-
             # biases, if any, should instead be initialized to zeros
             if module.bias is not None:
                 torch.nn.init.zeros_(module.bias) 
-
         # the embedding matrix doesn't count as an nn.Linear so we've gotta do it again for that
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=std)
@@ -397,16 +406,16 @@ class Hyperparameters:
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
-    val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
+    train_seq_len = 10*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
+    val_seq_len = 16*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 200 # number of iterations to run
+    num_iterations = 25_000 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture
     vocab_size = 50257
     # model size - setup for GPUs w/ 8GB of VRAM
-    num_layers = 4
+    num_layers = 8
     num_heads = 6
     model_dim = 384
     head_dim = None  # if None, will be set to model_dim // num_heads
@@ -414,7 +423,7 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 100 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
-    eigen_rank = 32
+    MoSBias = False
 
     def __post_init__(self):
         # Validate and set derived parameters
@@ -486,7 +495,7 @@ model: nn.Module = GPT(vocab_size=args.vocab_size,
                        model_dim=args.model_dim,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len),
                        mlp_ratio=args.mlp_ratio,
-                       eigen_rank=args.eigen_rank).cuda()
+                       MoSBias=args.MoSBias,).cuda()
 print0(f'{model.get_num_params()} parameters', console=True)
 print0(model)
 
@@ -640,7 +649,7 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-dist.destroy_process_group()
+
 
 # Then at the end of training:
 if master_process:
@@ -823,6 +832,8 @@ if master_process:
     # Check if the HellaSwag data file exists
     if os.path.exists(hellaswag_path):
         print0(f"Found HellaSwag dataset at {hellaswag_path}, running evaluation...", console=True)
-        evaluate_hellaswag(model, hellaswag_path, limit=20)
+        evaluate_hellaswag(model, hellaswag_path, limit=1014)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
+
+dist.destroy_process_group()

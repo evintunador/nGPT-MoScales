@@ -380,16 +380,16 @@ class Hyperparameters:
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
-    val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
+    train_seq_len = 10*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
+    val_seq_len = 16*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 10000 # number of iterations to run
+    num_iterations = 25_000 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture
     vocab_size = 50257
     # model size - setup for GPUs w/ 8GB of VRAM
-    num_layers = 6
+    num_layers = 8
     num_heads = 6
     model_dim = 384
     head_dim = None  # if None, will be set to model_dim // num_heads
@@ -621,7 +621,6 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-dist.destroy_process_group()
 
 # Then at the end of training:
 if master_process:
@@ -804,6 +803,8 @@ if master_process:
     # Check if the HellaSwag data file exists
     if os.path.exists(hellaswag_path):
         print0(f"Found HellaSwag dataset at {hellaswag_path}, running evaluation...", console=True)
-        evaluate_hellaswag(model, hellaswag_path, limit=500)
+        evaluate_hellaswag(model, hellaswag_path, limit=1014)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
+
+dist.destroy_process_group()

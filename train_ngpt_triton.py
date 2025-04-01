@@ -32,6 +32,10 @@ from kernels.cos_norm import cosine_norm_triton as cosine_norm
 from kernels.resid import resid_fwd_triton as resid
 #from kernels.resid import resid_fwd_frankenstein as resid # out of VRAM error bc of bwd
 
+def norm_(x: Tensor, dim: int = -1):
+    """in-place cosine normalization"""
+    x.div_(x.norm(p=2, dim=dim, keepdim=True))
+
 class Scale(nn.Module):
     """
     A module that manages learnable scaling parameters to ensure different learning rates
@@ -255,8 +259,11 @@ class GPT(nn.Module):
                 break
         
         if dim_to_normalize is not None:
-            # Normalize the weights in-place
-            cosine_norm_inplace_(module.weight.data, dim=dim_to_normalize)
+            if dim_to_normalize == module.weight.ndim - 1:
+                # Normalize the weights in-place
+                cosine_norm_inplace_(module.weight.data, dim=dim_to_normalize)
+            else:
+                norm_(module.weight.data, dim=dim_to_normalize)
 
     def enforce_constraints(self):
         """
@@ -383,16 +390,16 @@ class Hyperparameters:
     train_files = "data/fineweb*10B/fineweb*_train_*.bin" # input .bin to train on
     val_files = "data/fineweb*10B/fineweb*_val_*.bin" # input .bin to eval validation loss on
     val_tokens = 10485760 # how many tokens of validation data? it's important to keep this fixed for consistent comparisons
-    train_seq_len = 8*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
-    val_seq_len = 8*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
+    train_seq_len = 10*1024 # FlexAttention sequence length - reduced from 48*1024 for GPUs w/ at least 8GB VRAM during testing
+    val_seq_len = 16*1024 # FlexAttention sequence length for validation - reduced from 4*64*1024
     # optimization
-    num_iterations = 200 # number of iterations to run
+    num_iterations = 25_000 # number of iterations to run
     lr_init = 0.001
     lr_final = 0.0001
     # architecture
     vocab_size = 50257
     # model size - setup for GPUs w/ 8GB of VRAM
-    num_layers = 4
+    num_layers = 8
     num_heads = 6
     model_dim = 384
     head_dim = None  # if None, will be set to model_dim // num_heads
@@ -624,7 +631,6 @@ for step in range(train_steps + 1):
 
 print0(f"peak memory allocated: {torch.cuda.max_memory_allocated() // 1024 // 1024} MiB "
        f"reserved: {torch.cuda.max_memory_reserved() // 1024 // 1024} MiB", console=True)
-dist.destroy_process_group()
 
 # Then at the end of training:
 if master_process:
@@ -807,6 +813,8 @@ if master_process:
     # Check if the HellaSwag data file exists
     if os.path.exists(hellaswag_path):
         print0(f"Found HellaSwag dataset at {hellaswag_path}, running evaluation...", console=True)
-        evaluate_hellaswag(model, hellaswag_path, limit=20)
+        evaluate_hellaswag(model, hellaswag_path, limit=1014)
     else:
         print0(f"HellaSwag dataset not found at {hellaswag_path}, skipping evaluation.", console=True)
+
+dist.destroy_process_group()

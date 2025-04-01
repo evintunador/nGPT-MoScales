@@ -13,7 +13,7 @@ torch._dynamo.config.cache_size_limit = 256  # Increase from default of 8
 # fixes issue w frankenstein custom ops not keeping autograd graph during benchmark
 torch._functorch.config.donated_buffer=False
 
-# takes advantage of hardware
+# takes advantage of 3060 hardware
 torch.set_float32_matmul_precision('high')
 
 import triton
