@@ -26,11 +26,9 @@ from torch.nn.attention.flex_attention import BlockMask, flex_attention, create_
 # -----------------------------------------------------------------------------
 # PyTorch nn.Module definitions for the model
 
-from kernels.cos_norm import cosine_norm_triton_ as cosine_norm_inplace_
-from kernels.cos_norm import cosine_norm_triton as cosine_norm
-#from kernels.resid import resid_fwd_naive as resid
-from kernels.resid import resid_fwd_triton as resid
-#from kernels.resid import resid_fwd_frankenstein as resid # out of VRAM error bc of bwd
+def norm_(x: Tensor, dim: int = -1):
+    """in-place cosine normalization"""
+    x.div_(x.norm(p=2, dim=dim, keepdim=True))
 
 class Scale(nn.Module):
     """
@@ -56,24 +54,25 @@ class Scale(nn.Module):
         return self.s * (self.init / self.scale) # shape (heads, dim)
 
 class MoScale(nn.Module):
-    def __init__(self, dim: int, rank: int, bias: bool = False):
+    def __init__(self, dim: int, rank: int):
         super().__init__()
         assert rank < dim
         self.init = 0.05
         self.scale = 1. / math.sqrt(dim)
-        if bias:
-            self.s = nn.Parameter(torch.ones(dim, rank) * self.scale / rank / 2)
-            self.bias = nn.Parameter(torch.ones(rank) * self.scale / rank / 2)
-        else:
-            self.s = nn.Parameter(torch.ones(dim, rank) * self.scale / rank)
-            self.bias = None
+        self.s = nn.Parameter(torch.ones(dim, rank) * self.scale / rank)
+        """
+        rank = num_layers, so we divide by rank to give the post-softmax-weighted scales
+        the same varianceas the original Scale.
+
+        goal here was to maintain same number of params (altho flops & memory did increase) because
+        if a same number of parameters model does perform better then it'd be worth it later to
+        write a custom kernel that fuses the operation, therefore removing the increased memory usage and
+        largely mitigating the increased flops
+        """
 
     def forward(self, x): # (b, n, d)
         w = self.s * (self.init / self.scale)
-        if self.bias:
-            probs = F.softmax(x @ w + self.bias, dim=-1) # (b, n, r) where r << d
-        else:
-            probs = F.softmax(x @ w, dim=-1) # (b, n, r)
+        probs = F.softmax(x @ w, dim=-1) # (b, n, r)
         scales = probs.unsqueeze(2) * w.unsqueeze(0) # (b, n, 1, r) * (1, d, r) -> (b, n, d, r)
         scale = torch.sum(scales, dim=-1).squeeze(-1) # (b, n, d)
         return scale
@@ -129,8 +128,8 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.num_heads, self.head_dim)
         # normalizing & scaling our queries  & keys (see page 4)
         s_qk = self.s_qk() # (num_heads, head_dim)
-        q = cosine_norm(q) * s_qk # then scale each head
-        k = cosine_norm(k) * s_qk # no shape change
+        q = torch.nn.functional.normalize(q, p=2, dim=-1) * s_qk # then scale each head
+        k = torch.nn.functional.normalize(k, p=2, dim=-1) * s_qk # no shape change
         # apply RoPE
         q, k = self.rotary(q), self.rotary(k)
         # the meat of the attention calculation
@@ -173,19 +172,14 @@ class Block(nn.Module):
         self.attn = CausalSelfAttention(dim, num_heads, max_seq_len)
         self.mlp = MLP(dim, mlp_ratio)
 
-        #self.alpha_A = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
-            # not sure what scale to use with a_A and a_M. At one point i had it as 1./math.sqrt(cfg.dim)
-            # but now i can't find the reference to that in the paper
-        # eigen learning rate vector
-        #self.alpha_M = Scale(dim, init = 0.05, scale = 1. / math.sqrt(dim))
         self.alpha_A = MoS_A
         self.alpha_M = MoS_M
 
     def forward(self, x: Tensor, block_mask: BlockMask):
-        x_A = cosine_norm(self.attn(x, block_mask))
-        x = cosine_norm(x + self.alpha_A(x) * (x_A - x))
-        x_M = cosine_norm(self.mlp(x))
-        x = cosine_norm(x + self.alpha_M(x) * (x_M - x))
+        x_A = torch.nn.functional.normalize(self.attn(x, block_mask), p=2, dim=-1)
+        x = torch.nn.functional.normalize(x + self.alpha_A(x) * (x_A - x), p=2, dim=-1)
+        x_M = torch.nn.functional.normalize(self.mlp(x), p=2, dim=-1)
+        x = torch.nn.functional.normalize(x + self.alpha_M(x) * (x_M - x), p=2, dim=-1)
         return x
 
 # -----------------------------------------------------------------------------
@@ -195,14 +189,14 @@ def next_multiple_of_n(v: float | int, *, n: int):
     return next(x for x in range(n, int(v) + 1 + n, n) if x >= v)
 
 class GPT(nn.Module):
-    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int, MoSBias: bool):
+    def __init__(self, vocab_size: int, num_layers: int, num_heads: int, model_dim: int, max_seq_len: int, mlp_ratio: int):
         super().__init__()
         self.max_seq_len = max_seq_len
         self.model_dim = model_dim
         self.vocab_size = vocab_size
         self.embed = nn.Embedding(vocab_size, model_dim)
-        self.MoS_A = MoScale(model_dim, num_layers, bias=MoSBias)
-        self.MoS_M = MoScale(model_dim, num_layers, bias=MoSBias)
+        self.MoS_A = MoScale(model_dim, num_layers)
+        self.MoS_M = MoScale(model_dim, num_layers)
         self.blocks = nn.ModuleList(
             [Block(model_dim, num_heads, mlp_ratio, max_seq_len, i, self.MoS_A, self.MoS_M) 
             for i in range(num_layers)])
@@ -279,7 +273,7 @@ class GPT(nn.Module):
         
         if dim_to_normalize is not None:
             # Normalize the weights in-place
-            cosine_norm_inplace_(module.weight.data, dim=dim_to_normalize)
+            norm_(module.weight.data, dim=dim_to_normalize)
 
     def enforce_constraints(self):
         """
@@ -292,6 +286,8 @@ class GPT(nn.Module):
             #for layer in self.blocks:
                 #layer.alpha_A.s.data.abs_()
                 #layer.alpha_M.s.data.abs_()
+            # we no longer do this bc it wasn't strictly necessary in the first place and it'd
+            # ruin the cosine similarity used in MoS
             
             # Cosine normalize relevant Linear layers
             for module in self.modules():
@@ -423,7 +419,6 @@ class Hyperparameters:
     # evaluation and logging
     val_loss_every = 100 # every how many steps to evaluate val loss? 0 for only at the end
     save_checkpoint = False
-    MoSBias = False
 
     def __post_init__(self):
         # Validate and set derived parameters
@@ -494,8 +489,7 @@ model: nn.Module = GPT(vocab_size=args.vocab_size,
                        num_heads=args.num_heads, 
                        model_dim=args.model_dim,
                        max_seq_len=max(args.train_seq_len, args.val_seq_len),
-                       mlp_ratio=args.mlp_ratio,
-                       MoSBias=args.MoSBias,).cuda()
+                       mlp_ratio=args.mlp_ratio,).cuda()
 print0(f'{model.get_num_params()} parameters', console=True)
 print0(model)
 
