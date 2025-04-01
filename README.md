@@ -13,3 +13,5 @@ torchrun --nproc_per_node=2 train_ngpt_triton.py
 ```
 torchrun --nproc_per_node=2 train_MoScale.py
 ```
+
+[![ERROR DISPLAYING IMAGE, CLICK HERE FOR VIDEO](https://img.youtube.com/vi/kQuergztWkQ/0.jpg)](https://www.youtube.com/watch?v=kQuergztWkQ)
